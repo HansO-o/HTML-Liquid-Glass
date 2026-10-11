@@ -214,6 +214,7 @@ uniform float uFuseTop[8];   // 1 when that neighbour is painted above this glas
 uniform vec4 uFuseTint[8];   // that neighbour's CSS background colour (straight alpha)
 uniform int uFuseN;
 uniform vec4 uTintSelf;      // this glass's CSS background colour
+uniform float uOwnTint;      // 1 while this glass hosts the backplate: its CSS background is off, painted here
 uniform float uBlend, uPress;
 out vec4 o;
 
@@ -297,6 +298,7 @@ void main() {
   float sdSelf = boxSd(p, outward);
   float sd = sdSelf, mE = m;
   float bridge = 0.0;          // part of this pixel that no glass box (and so no element background) covers
+  float ownCov = clamp(0.5 - sdSelf * uDpr, 0.0, 1.0);
   vec4 tintE = uTintSelf;
   if (uFuseN > 0) {
     // who draws this pixel: own interior is ours; an overlap belongs to the glass painted lowest, so the
@@ -309,7 +311,9 @@ void main() {
       vec2 nj;
       float sj = rrSd(p - uFuse[i].xy, uFuse[i].zw, uFuseR[i], nj);
       if (sj < 0.0) { inOther = true; if (uFuseTop[i] < 0.5) belowOther = true; }
-      if (sj < sdSelf) closer = true;
+      // equally close: the glass painted lower draws it (UnionField decides the same way)
+      float dd = sj - sdSelf;
+      if (dd < -1e-3 || (abs(dd) <= 1e-3 && uFuseTop[i] < 0.5)) closer = true;
       uncovered *= clamp(0.5 + sj * uDpr, 0.0, 1.0);
     }
     bool own = sdSelf < 0.0 ? !(inOther && belowOther) : (!inOther && !closer);
@@ -402,8 +406,10 @@ void main() {
   }
   float hiT = 1.0 - (1.0 - hi) * (1.0 - kl);
   vec4 over = vec4(vec3(hiT), 1.0 - (1.0 - kd) * (1.0 - hiT));   // premultiplied, over the live page
-  // a bridge has no element under it to carry the CSS background colour, so it is painted here
-  over += vec4(tintE.rgb * tintE.a, tintE.a) * bridge * (1.0 - over.a);
+  // a bridge has no element under it to carry the CSS background colour, so it is painted here (and so is
+  // this glass's own background while it hosts the backplate, which would otherwise filter it)
+  vec4 tintP = vec4(tintE.rgb * tintE.a, tintE.a) * bridge + vec4(uTintSelf.rgb * uTintSelf.a, uTintSelf.a) * ownCov * uOwnTint;
+  over += tintP * (1.0 - over.a);
   vec4 lens = mix(over, vec4(mix(col * (1.0 - kd), vec3(1.0), hiT), 1.0), rim);
   o = lens * aa + vec4(0.0, 0.0, 0.0, sh) * (1.0 - aa);
 }`;
@@ -411,7 +417,7 @@ void main() {
 const UNIFORMS = ['uSnap', 'uHaloTex', 'uSnapSize', 'uCenterSnap', 'uCanvasPx', 'uHalf', 'uLight', 'uTouch', 'uShadowGeom', 'uA',
   'uSnapScale', 'uDpr', 'uRad', 'uPad', 'uBezel', 'uK', 'uThick', 'uIor', 'uGap', 'uDisp', 'uFrost', 'uSpec',
   'uTint', 'uSat', 'uDim', 'uShadow', 'uTouchAmt', 'uHalo', 'uGlyphDark', 'uNative', 'uOther', 'uOtherR', 'uOtherN',
-  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseN', 'uTintSelf', 'uBlend', 'uPress'];
+  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uBlend', 'uPress'];
 
 class Renderer {
   constructor(canvas) {
@@ -484,14 +490,13 @@ class Renderer {
     gl.activeTexture(gl.TEXTURE0);
     return t;
   }
-  // every copy out of the shared canvas copies its whole drawing buffer, so it should not stay at the size of
-  // the largest glass ever drawn (an opened, then closed, big panel): shrink it after a second of drawing less
-  endFrame() {
-    if (!this.usedW) return;
-    const big = this.canvas.width * this.canvas.height > this.usedW * this.usedH * 1.5;
-    this.slack = big ? (this.slack || 0) + 1 : 0;
-    if (this.slack > 60) { this.canvas.width = this.usedW; this.canvas.height = this.usedH; this.slack = 0; }
-    this.usedW = 0; this.usedH = 0;
+  // every copy out of the shared canvas copies its whole drawing buffer, so it should not keep the size of the
+  // largest glass ever drawn (a panel opened and closed again): after 2 s of being much bigger than every glass
+  // on screen (w x h, device px) it shrinks to that. Never below it, so it does not reallocate back and forth
+  endFrame(w, h, now) {
+    if (!w || !h || this.canvas.width * this.canvas.height <= w * h * 1.5) { this.bigSince = 0; return; }
+    if (!this.bigSince) this.bigSince = now;
+    else if (now - this.bigSince > 2000) { this.canvas.width = w; this.canvas.height = h; this.bigSince = 0; }
   }
 
   draw(g, snap, native) {
@@ -501,7 +506,6 @@ class Renderer {
       this.canvas.width = Math.max(this.canvas.width, cw);
       this.canvas.height = Math.max(this.canvas.height, ch);
     }
-    this.usedW = Math.max(this.usedW || 0, cw); this.usedH = Math.max(this.usedH || 0, ch);
     gl.viewport(0, 0, cw, ch);
     gl.enable(gl.SCISSOR_TEST);
     gl.scissor(0, 0, cw, ch);
@@ -575,6 +579,7 @@ class Renderer {
     gl.uniform4fv(U.uFuseTint, fc);
     gl.uniform1i(U.uFuseN, fuse.length);
     gl.uniform4fv(U.uTintSelf, g.tint);
+    gl.uniform1f(U.uOwnTint, g.bgHold ? 1 : 0);
     gl.uniform1f(U.uBlend, g.blendK());
     gl.uniform1f(U.uPress, g.press || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -815,13 +820,22 @@ class Capturer {
     if (this.busy) { this.queued = true; return; }
     if (this.timer || this.waiting) return;
     const delay = Math.max(16, this.next - performance.now());
-    this.timer = setTimeout(() => {
+    const go = () => {
       this.timer = 0;
+      // a capture blocks the main thread for a while (and Safari has no requestIdleCallback): not while a
+      // pointer is down, unless the drag goes on for more than 1.5 s
+      const now = performance.now();
+      if (this.M.pointers.size) {
+        if (!this.heldSince) this.heldSince = now;
+        if (now - this.heldSince < 1500) { this.timer = setTimeout(go, 250); return; }
+      }
+      this.heldSince = 0;
       this.waiting = true;
       // run when the main thread is idle, so a capture never lands in the middle of a drag frame
       if (global.requestIdleCallback) global.requestIdleCallback(() => this.run(), { timeout: 400 });
       else this.run();
-    }, delay);
+    };
+    this.timer = setTimeout(go, delay);
   }
   async run() {
     this.waiting = false;
@@ -970,7 +984,9 @@ class Glass {
     this.plate = null;         // shared backplate while fused with other glass
     this.press = 0;
     this.layer = '';
-    this.scaleProp = 1;
+    this.pageScale = 1;
+    this.solid = false;
+    this.clips = false;
     this.bgColor = '';
     this.tint = new Float32Array(4);   // CSS background colour, painted on the bridges while fused
     this.geom = null;
@@ -992,7 +1008,12 @@ class Glass {
     Object.assign(this.canvas.style, { position: 'absolute', zIndex: '-1', pointerEvents: 'none', display: 'block', margin: '0' });
     el.insertBefore(this.canvas, el.firstChild);
     this.ctx = this.canvas.getContext('2d');
-    this.ro = new ResizeObserver(() => { this.geom = null; this.dirty = true; });
+    this.ro = new ResizeObserver((es) => {
+      // the exact (fractional) border box, for telling a transform's scale from offsetWidth's rounding
+      const b = es[0] && es[0].borderBoxSize && es[0].borderBoxSize[0];
+      if (b) { this.boxW = b.inlineSize; this.boxH = b.blockSize; }
+      this.geom = null; this.dirty = true;
+    });
     this.ro.observe(el);
     this.bindPointer();
     this.bindDrag();
@@ -1094,15 +1115,19 @@ class Glass {
           try { el.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
           el.style.cursor = 'grabbing';
         },
+        // follows from the first move; the 4 px only decide whether this was a tap (then it goes back)
         pointermove: (e) => {
           if (e.pointerId !== d.id) return;
           const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
-          if (!d.moved && Math.hypot(dx, dy) < 4) return;
-          d.moved = true;
+          if (!d.moved && Math.hypot(dx, dy) >= 4) d.moved = true;
           d.x = d.bx + dx; d.y = d.by + dy;
           el.style.translate = `${d.x}px ${d.y}px`;
         },
-        pointerup: (e) => { if (e.pointerId === d.id) { d.id = -1; el.style.cursor = 'grab'; } },
+        pointerup: (e) => {
+          if (e.pointerId !== d.id) return;
+          d.id = -1; el.style.cursor = 'grab';
+          if (!d.moved && (d.x !== d.bx || d.y !== d.by)) { d.x = d.bx; d.y = d.by; el.style.translate = `${d.x}px ${d.y}px`; }
+        },
         pointercancel: (e) => { if (e.pointerId === d.id) { d.id = -1; el.style.cursor = 'grab'; } },
         // a drag never counts as a click on whatever is under the pointer
         click: (e) => { if (d.moved) { e.stopPropagation(); e.preventDefault(); d.moved = false; } },
@@ -1119,13 +1144,15 @@ class Glass {
   // (disp too: the merged shape is refracted by one filter with one dispersion)
   material() { const P = this.p; return [P.frost, P.sat, P.tint, P.dim, P.disp].join(','); }
 
+  // fusing needs a shared backplate that sits under both: siblings (same clip and stacking context), both
+  // drawn as plain opaque boxes (no hidden or fading glass, no rotation or uneven scale)
   fusesWith(o) {
-    return this.p.merge && o.p.merge && o.layer === this.layer && this.material() === o.material() &&
-      this.gapTo(o) < Math.min(this.p.blend, o.p.blend);
+    return this.p.merge && o.p.merge && this.solid && o.solid && o.el.parentElement === this.el.parentElement &&
+      o.layer === this.layer && this.material() === o.material() && this.gapTo(o) < Math.min(this.p.blend, o.p.blend);
   }
 
-  // css px of the page per local css px of this element (transform and the scale property)
-  frameScale() { const A = this.frame.A; return (Math.sqrt(Math.abs(A[0] * A[3] - A[1] * A[2])) || 1) * this.scaleProp; }
+  // page px per local css px of this element (its own and its ancestors' transforms and scale)
+  frameScale() { return this.pageScale || 1; }
   // how far the smooth union reaches, local css px (the bridges must fit on the canvas around the element)
   blendK() { return Math.max(1, Math.min(this.p.blend, this.geom.pad * 1.6)); }
 
@@ -1202,6 +1229,22 @@ class Glass {
     this.haloCanvas = c;
     this.haloUrl = c.toDataURL();
     if (this.M.renderer) this.haloTex = this.M.renderer.haloTexture(c, this.haloTex);
+  }
+
+  // While this glass hosts a backplate, its CSS background colour is painted under the plate and would be
+  // filtered by it: switch it off (restored exactly afterwards) and let the canvas paint the same colour
+  holdBackground(on) {
+    if (on === !!this.bgHold) return;
+    const st = this.el.style;
+    if (on) {
+      if (!(this.tint[3] > 0) || getComputedStyle(this.el).backgroundImage !== 'none') return;
+      this.bgHold = { value: st.getPropertyValue('background-color'), prio: st.getPropertyPriority('background-color') };
+      st.setProperty('background-color', 'transparent', 'important');
+    } else {
+      st.setProperty('background-color', this.bgHold.value, this.bgHold.prio);
+      this.bgHold = null;
+    }
+    this.dirty = true;
   }
 
   cssBackdrop() {
@@ -1326,6 +1369,7 @@ class Glass {
     this.visible = false;
     if (!this.ensureGeom()) return false;
     const r = this.el.getBoundingClientRect();
+    if (!r.width && !r.height) return false;   // hidden this frame; its ResizeObserver resets geom later
     const cs = getComputedStyle(this.el);
     const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
     let A = [1, 0, 0, 1];
@@ -1334,9 +1378,13 @@ class Glass {
       A = [mm.a, mm.b, mm.c, mm.d];
     }
     this.frame.cx = cx; this.frame.cy = cy; this.frame.A = A;
-    const sp = cs.scale && cs.scale !== 'none' ? cs.scale.split(/\s+/).map(parseFloat) : null;
-    this.scaleProp = sp ? Math.sqrt(Math.abs((sp[0] || 1) * (sp.length > 1 ? sp[1] : sp[0] || 1))) || 1 : 1;
-    if (cs.backgroundColor !== this.bgColor) { this.bgColor = cs.backgroundColor; this.tint.set(parseColor(this.bgColor)); }
+    const sx = r.width / (this.boxW || this.geom.w), sy = r.height / (this.boxH || this.geom.h);
+    this.pageScale = (sx + sy) / 2 || 1;
+    this.solid = cs.visibility === 'visible' && +cs.opacity >= 0.999 && Math.abs(A[1]) < 1e-3 && Math.abs(A[2]) < 1e-3 &&
+      Math.abs(sx - sy) <= 0.002 * Math.max(sx, sy);
+    this.clips = cs.overflowX !== 'visible' || cs.overflowY !== 'visible' || /paint|strict|content/.test(cs.contain || '') ||
+      (cs.clipPath && cs.clipPath !== 'none');
+    if (!this.bgHold && cs.backgroundColor !== this.bgColor) { this.bgColor = cs.backgroundColor; this.tint.set(parseColor(this.bgColor)); }
     this.rect = r;
     this.layer = (cs.position === 'fixed' ? 'f' : 'n') + '|' + cs.zIndex;
     if (this.p.adaptive) this.luminance = this.M.luminanceAt(cx, cy, this.geom.hw * 0.8, this.geom.hh * 0.8);
@@ -1364,7 +1412,7 @@ class Glass {
     if (eng === 'snapshot' && !useSnap) return false;
     const f = this.frame;
     const rk = (o) => [o.rect.left, o.rect.top, o.rect.width, o.rect.height].map((v) => v.toFixed(1)).join(',') + o.bgColor;
-    const key = [eng, this.press.toFixed(3), this.bgColor,
+    const key = [eng, this.press.toFixed(3), this.bgColor, this.bgHold ? 'h' : '',
       useSnap ? [f.cx.toFixed(2), f.cy.toFixed(2), global.scrollX, global.scrollY, snap.version].join(',') : '',
       useSnap ? f.A.map((v) => v.toFixed(4)).join(',') : '',
       this.fuse.length ? rk(this) + ':' + this.fuse.map(rk).join(';') : '', useSnap ? this.others.map(rk).join(';') : ''].join('|');
@@ -1479,7 +1527,7 @@ class UnionField {
     let inside = -1, near = 0;
     for (let i = 0; i < this.N; i++) {
       if (this.sd[i] < 0 && inside < 0) inside = i;   // an overlap belongs to the lowest glass
-      if (this.sd[i] < this.sd[near]) near = i;
+      if (this.sd[i] < this.sd[near] - 1e-3) near = i;   // ties go to the lower glass, as in the shader
     }
     const o = inside >= 0 ? inside : near, k = this.k[o], nb = this.nb[o];
     let sd = this.sd[o], nx = this.nx[o], ny = this.ny[o], m = this.m[o];
@@ -1570,22 +1618,26 @@ class Plate {
     this.place();
   }
 
-  // same layer as the glass, right before (so under) the lowest glass of the group
+  // Inside the lowest glass of the group, right after its canvas and under it (z-index -2 in the glass's own
+  // stacking context): painted after everything below the group and before every member's content, clipped,
+  // scrolled and transformed with the glass, and without adding an element among the page's own children.
+  // The glass's backdrop-filter is off while it is fused, so it is not a backdrop root for the plate.
   place() {
-    const a = this.anchor.el, cs = getComputedStyle(a);
-    this.layer = this.anchor.layer;
+    const a = this.anchor;
     this.el.style.cssText = 'all:initial;display:block;margin:0;padding:0;border:0;box-sizing:border-box;pointer-events:none;' +
-      `position:${cs.position === 'fixed' ? 'fixed' : 'absolute'};z-index:${cs.zIndex};left:0;top:0;width:0;height:0;`;
-    a.parentNode.insertBefore(this.el, a);
+      'position:absolute;z-index:-2;left:0;top:0;width:0;height:0;';
+    a.el.insertBefore(this.el, a.canvas.nextSibling);
+    a.holdBackground(true);
     this.tx = 0; this.ty = 0; this.w = -1; this.h = -1; this.key = ''; this.bf = '';
     this.measure();
   }
-  inPlace() { return this.el.nextSibling === this.anchor.el && this.layer === this.anchor.layer; }
+  inPlace() { return this.el.parentNode === this.anchor.el; }
 
-  // pass 1: where the plate's own origin is (it is positioned with a transform from there)
+  // pass 1: where the plate's own origin is on the page (it is positioned with a translate from there), in
+  // the glass's local css px (s = page px per local px)
   measure() {
-    const r = this.el.getBoundingClientRect();
-    this.ox = r.left - this.tx; this.oy = r.top - this.ty;
+    const r = this.el.getBoundingClientRect(), s = this.anchor.frameScale();
+    this.ox = r.left - this.tx * s; this.oy = r.top - this.ty * s;
   }
 
   update(members) {
@@ -1602,16 +1654,21 @@ class Plate {
       d.nb = d.g.fuse.map((o) => D.find((e) => e.g === o)).filter(Boolean);
       grow = Math.max(grow, d.k * 0.25 * Math.max(1, d.nb.length));
     }
-    grow = Math.ceil(grow + 2);
-    x0 -= grow; y0 -= grow;
-    const W = Math.ceil(x1 + grow - x0), H = Math.ceil(y1 + grow - y0);
-    for (const d of D) { d.cx -= x0; d.cy -= y0; }
+    grow += 2;
+    x0 -= grow; y0 -= grow; x1 += grow; y1 += grow;
+    // from here on in the plate's own units: the lowest glass's local css px, from the plate's top left
+    const s = this.anchor.frameScale();
+    const W = Math.ceil((x1 - x0) / s), H = Math.ceil((y1 - y0) / s);
+    for (const d of D) {
+      d.cx = (d.cx - x0) / s; d.cy = (d.cy - y0) / s;
+      d.hw /= s; d.hh /= s; d.r /= s; d.m /= s; d.k /= s;
+    }
 
     // follows the glass every frame; the outline is only rebuilt when the glass moved relative to each other
-    const tx = Math.round((x0 - this.ox) * 100) / 100, ty = Math.round((y0 - this.oy) * 100) / 100;
+    const tx = Math.round((x0 - this.ox) / s * 100) / 100, ty = Math.round((y0 - this.oy) / s * 100) / 100;
     if (tx !== this.tx || ty !== this.ty) { this.tx = tx; this.ty = ty; this.el.style.transform = `translate(${tx}px, ${ty}px)`; }
     if (W !== this.w || H !== this.h) { this.w = W; this.h = H; this.el.style.width = W + 'px'; this.el.style.height = H + 'px'; }
-    const key = [native ? 'n' : 's', this.M.dpr, W, H].concat(D.map((d) =>
+    const key = [native ? 'n' : 's', W, H].concat(D.map((d) =>
       [d.cx, d.cy, d.hw, d.hh, d.r, d.k].map((v) => v.toFixed(2)).join(',') + '/' + d.nb.map((e) => D.indexOf(e)).join('.') +
       '/' + OPTICAL.map((n) => d.P[n]).join(','))).join('|');
     if (key !== this.key) {
@@ -1708,6 +1765,7 @@ class Plate {
 
   destroy() {
     this.el.remove();
+    this.anchor.holdBackground(false);
     if (this.filters) for (const f of this.filters) f.remove();
     this.filters = null;
   }
@@ -1722,7 +1780,7 @@ class Manager {
     this.started = false;
     this.stats = {
       engine: '', glasses: 0, captures: 0, lastCaptureMs: 0, captureOnlyMs: 0, uploadMs: 0, renderMs: 0,
-      snapW: 0, snapH: 0, scale: 0, live: 0, holes: 0, error: '', parts: null, plates: 0, plateBuilds: 0, plateMs: 0,
+      snapW: 0, snapH: 0, scale: 0, live: 0, holes: 0, error: '', parts: null, plates: 0, plateBuilds: 0, plateMs: 0, rafMs: 0, inputFrames: 0,
     };
     this.plates = new Map();   // lowest glass of a fused group -> its shared backplate
   }
@@ -1744,8 +1802,10 @@ class Manager {
     this.watch();
     this.tick = this.tick.bind(this);
     this.lastTick = performance.now();
+    this.pumped = false; this.pumpT = 0; this.pumpWall = 0; this.rafDt = 0; this.lastRafT = 0;
     this.hookRaf();
     this.rafId = this.raf(this.tick);
+    this.watchThrottle();
   }
 
   // a lost WebGL context (GPU reset, too many contexts) is rebuilt and everything redrawn
@@ -1804,6 +1864,8 @@ class Manager {
   }
 
   forget(g) {
+    const pl = this.plates.get(g);
+    if (pl) { pl.destroy(); this.plates.delete(g); }
     this.glasses = this.glasses.filter((x) => x !== g);
     if (this.map.get(g.el) === g) this.map.delete(g.el);
   }
@@ -1823,6 +1885,29 @@ class Manager {
     for (const g of this.glasses) g.plate = null;
   }
 
+  // The backplate lives inside the lowest glass of the group, so it must not be clipped there, and nothing
+  // may be painted between the members over their area (it would show through the upper ones unfrosted)
+  plateFits(members) {
+    const first = members[0], last = members[members.length - 1];
+    if (first.clips) return false;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const m of members) { const r = m.rect; x0 = Math.min(x0, r.left); y0 = Math.min(y0, r.top); x1 = Math.max(x1, r.right); y1 = Math.max(y1, r.bottom); }
+    const layerZ = (z) => (z === 'auto' || z === '0' ? 0 : +z);
+    const z = layerZ(getComputedStyle(first.el).zIndex);
+    const inGroup = new Set(members.map((m) => m.el));
+    for (let n = first.el.nextElementSibling; n && n !== last.el; n = n.nextElementSibling) {
+      if (inGroup.has(n)) continue;
+      const cs = getComputedStyle(n);
+      // painted with the positioned layer: positioned, or a stacking context of its own
+      const layered = cs.position !== 'static' || +cs.opacity < 1 || cs.transform !== 'none' || cs.filter !== 'none' ||
+        cs.isolation === 'isolate' || cs.zIndex !== 'auto';
+      if (!layered || layerZ(cs.zIndex) !== z || cs.display === 'none' || cs.visibility !== 'visible') continue;
+      const r = n.getBoundingClientRect();
+      if (r.right > x0 && r.left < x1 && r.bottom > y0 && r.top < y1) return false;
+    }
+    return true;
+  }
+
   // pass 2b: fused glass forms groups (connected through g.fuse); each group gets one backplate
   updatePlates() {
     const next = new Map(), seen = new Set();
@@ -1837,6 +1922,14 @@ class Manager {
         for (const o of x.fuse) if (!seen.has(o)) { seen.add(o); stack.push(o); }
       }
       members.sort((a, b) => (a.paintsBelow(b) ? -1 : 1));
+      if (!this.plateFits(members)) {
+        // no backplate can sit under all of them: they stay separate pieces of glass
+        for (const m of members) {
+          for (const o of m.fuse) if (m.overlaps(o.rect) && m.others.length < 8) m.others.push(o);
+          m.fuse = [];
+        }
+        continue;
+      }
       const anchor = members[0];
       let pl = this.plates.get(anchor);
       if (pl && !pl.inPlace()) { pl.destroy(); pl = null; }
@@ -1911,6 +2004,12 @@ class Manager {
 
   watch() {
     const req = () => this.capturer.request();
+    this.pointers = new Set();
+    const up = (e) => this.pointers.delete(e.pointerId);
+    global.addEventListener('pointerdown', (e) => this.pointers.add(e.pointerId), true);
+    global.addEventListener('pointerup', up, true);
+    global.addEventListener('pointercancel', up, true);
+    global.addEventListener('blur', () => this.pointers.clear());
     this.mo = new MutationObserver((recs) => { if (recs.some(mutationMatters)) req(); });
     this.mo.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
     const onEvt = (e) => { if (!isIgnored(e.target)) req(); };
@@ -1986,23 +2085,82 @@ class Manager {
     const raf = global.requestAnimationFrame.bind(global), caf = global.cancelAnimationFrame.bind(global);
     const M = this;
     this.raf = raf;
+    // page callbacks waiting for a frame, by the id the page got (the browser's id of the first request);
+    // nid is the browser request it currently waits on (a pointer-driven frame can push it back, see pump)
+    const pending = this.pendingRaf = new Map();
+    const run = (p, t) => {
+      pending.delete(p.id);
+      try { p.cb(t); } finally {
+        // a page callback ran after the SDK in this frame (it was queued later): redo the glass right now,
+        // and queue the SDK's next tick behind whatever this callback just queued
+        if (M.tickT === t && M.rafId) {
+          caf(M.rafId);
+          M.rafId = raf(M.tick);
+          try { M.frame(t); } catch (err) { console.warn('[LiquidGlass]', err); }
+        }
+      }
+    };
+    const fire = (p) => (t) => {
+      if (pending.get(p.id) !== p) return;
+      if (M.isPumped()) { p.nid = raf(fire(p)); return; }   // this rendering update already ran it
+      run(p, Math.max(t, M.pumpT));
+    };
     global.requestAnimationFrame = function requestAnimationFrame(cb) {
       if (typeof cb !== 'function') return raf(cb);
-      return raf(function (t) {
-        try { return cb(t); } finally {
-          if (M.tickT === t && M.rafId) {
-            caf(M.rafId);
-            M.rafId = raf(M.tick);
-            try { M.frame(t); } catch (err) { console.warn('[LiquidGlass]', err); }
-          }
-        }
-      });
+      const p = { cb, id: 0, nid: 0 };
+      p.id = p.nid = raf(fire(p));
+      pending.set(p.id, p);
+      return p.id;
+    };
+    global.cancelAnimationFrame = function cancelAnimationFrame(id) {
+      const p = pending.get(id);
+      if (p) { pending.delete(id); caf(p.nid); } else caf(id);
+    };
+    this.runPending = (t) => {
+      for (const p of Array.from(pending.values())) if (pending.get(p.id) === p) { caf(p.nid); run(p, t); }
     };
   }
 
+  // WebKit (Safari, and every browser on iOS / iPadOS) runs requestAnimationFrame at half rate in a cross-origin
+  // frame until the user taps or clicks in it, and a touch drag does not count (bugs.webkit.org/show_bug.cgi?id=170534,
+  // /show_bug.cgi?id=213344): an embedded page drags at 30 fps although the screen still updates at 60. While
+  // that throttle is on, each pointermove runs one frame itself (the page's queued callbacks, then the glass),
+  // at most once per rendering update: a 1px sentinel resized with each such frame tells, through a
+  // ResizeObserver, when the update has been rendered. Nothing changes while the pointer is still, outside
+  // cross-origin frames, in Chromium, or once a tap has lifted the throttle.
+  isPumped() { return this.pumped && performance.now() - this.pumpWall < 100; }
+
+  watchThrottle() {
+    let xframe = false;
+    try { xframe = global.top !== global && !global.top.location.href; } catch (err) { xframe = true; }
+    if (!xframe || IS_CHROMIUM || typeof ResizeObserver === 'undefined') return;
+    const s = document.createElement('div');
+    s.setAttribute('data-lg-ignore', '');
+    s.setAttribute('aria-hidden', 'true');
+    s.style.cssText = 'all:initial;display:block;position:fixed;left:0;top:0;width:1px;height:1px;visibility:hidden;pointer-events:none;contain:strict;';
+    document.documentElement.appendChild(s);
+    new ResizeObserver(() => { this.pumped = false; }).observe(s);
+    let w = 1;
+    // bubble phase on window: the page's own handlers (and the SDK's drag) have already moved things
+    global.addEventListener('pointermove', () => {
+      if (this.isPumped() || !(this.rafDt > 24) || !s.isConnected) return;
+      const t = Math.max(performance.now(), this.pumpT);
+      this.pumped = true; this.pumpT = t; this.pumpWall = performance.now();
+      w = 3 - w; s.style.width = w + 'px';
+      this.stats.inputFrames++;
+      this.runPending(t);
+      try { this.frame(t); } catch (err) { console.warn('[LiquidGlass]', err); }
+    }, { passive: true });
+  }
+
   tick(now) {
+    const d = now - this.lastRafT;
+    this.lastRafT = now;
+    if (d > 0 && d < 250) this.rafDt = this.rafDt ? this.rafDt * 0.8 + d * 0.2 : d;
+    this.stats.rafMs = this.rafDt;
     this.tickT = now;
     this.rafId = this.raf(this.tick);
+    if (this.isPumped()) return;   // a pointer-driven frame already ran in this rendering update
     this.frame(now);
   }
 
@@ -2018,12 +2176,25 @@ class Manager {
     // the WebGL highlights; in the snapshot engine also the snapshot the rim is refracted from
     const canFuse = !!this.renderer && !this.contextLost &&
       (this.engine === 'native' || (this.engine === 'snapshot' && !!(this.snap && this.snap.uploaded)));
+    const cand = new Map();
     for (const g of this.glasses) {
       g.fuse = []; g.others = [];
       if (!g.visible) continue;
+      const c = [];
       for (const o of this.glasses) {
         if (o === g || !o.visible) continue;
-        if (canFuse && g.fusesWith(o)) { if (g.fuse.length < 8) g.fuse.push(o); }
+        if (canFuse && g.fusesWith(o)) c.push(o);
+        else if (g.overlaps(o.rect) && g.others.length < 8) g.others.push(o);
+      }
+      // at most 8 neighbours (the shader's limit): the nearest ones, kept only when the choice is mutual, so
+      // every glass knows each neighbour that draws next to it
+      if (c.length > 8) c.sort((a, b) => g.gapTo(a) - g.gapTo(b));
+      cand.set(g, c);
+    }
+    for (const [g, c] of cand) {
+      for (const o of c) {
+        const back = cand.get(o);
+        if (c.indexOf(o) < 8 && back.indexOf(g) < 8) g.fuse.push(o);
         else if (g.overlaps(o.rect) && g.others.length < 8) g.others.push(o);
       }
     }
@@ -2032,7 +2203,11 @@ class Manager {
     // pass 3: draw what changed
     let drew = 0;
     if (!this.contextLost) for (const g of this.glasses) if (g.render(this.snap)) drew++;
-    if (drew) this.renderer.endFrame();
+    if (drew) {
+      let w = 0, h = 0;
+      for (const g of this.glasses) if (g.visible) { w = Math.max(w, g.canvas.width); h = Math.max(h, g.canvas.height); }
+      this.renderer.endFrame(w, h, now);
+    }
     const cost = performance.now() - t0;
     if (drew || live) this.stats.renderMs = this.stats.renderMs * 0.9 + cost * 0.1;
     this.stats.live = live;

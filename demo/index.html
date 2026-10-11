@@ -336,8 +336,8 @@ p code, li code, td code { background: #e8eaef; padding: 1px 6px; border-radius:
 
   <section id="merge">
     <h2>靠近就融合</h2>
-    <p>同一层（相同 z-index、相同定位方式）、同一种材质的玻璃不会互相压出边缘。两块玻璃的距离小于 <code>blend</code>（默认 24px）时，形状开始像水滴一样连在一起；叠在一起时共用一块背板，重叠的部分没有内边缘，高光和投影也只沿着整体的外轮廓走。</p>
-    <p>融合以后，SDK 在这组玻璃下面放一块共用的背板，由它显示整个融合形状下面的页面，玻璃自己的背景滤镜先关掉。原生引擎里背板是按融合后的轮廓生成位移图的 SVG 滤镜，快照引擎里是裁成轮廓的 CSS 模糊；两种情况过滤的都是实时页面，所以融合不截图，玻璃后面的画面也不会变。高光和投影仍然每个像素只由一块玻璃负责：自己的内部归自己，重叠部分归画在最下面的那块，两块之间的连接桥归离得近的那块。在参数面板里新建几块面板，把它们拖到一起试试；不想融合的元素设 <code>merge: false</code>。</p>
+    <p>同一层（同一个父元素下、相同 z-index 和定位方式）、同一种材质的玻璃不会互相压出边缘。两块玻璃的距离小于 <code>blend</code>（默认 24px）时，形状开始像水滴一样连在一起；叠在一起时共用一块背板，重叠的部分没有内边缘，高光和投影也只沿着整体的外轮廓走。</p>
+    <p>融合以后，SDK 在这组玻璃最下面那块里面放一块共用的背板，由它显示整个融合形状下面的页面，玻璃自己的背景滤镜先关掉。原生引擎里背板是按融合后的轮廓生成位移图的 SVG 滤镜，快照引擎里是裁成轮廓的 CSS 模糊；两种情况过滤的都是实时页面，所以融合不截图，玻璃后面的画面也不会变。高光和投影仍然每个像素只由一块玻璃负责：自己的内部归自己，重叠部分归画在最下面的那块，两块之间的连接桥归离得近的那块。在参数面板里新建几块面板，把它们拖到一起试试；不想融合的元素设 <code>merge: false</code>。</p>
   </section>
 
   <section id="refresh">
@@ -528,6 +528,7 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
         <dt>挖空区域</dt><dd id="s-holes">—</dd>
         <dt>每帧绘制</dt><dd id="s-render">—</dd>
         <dt>实时图层</dt><dd id="s-live">—</dd>
+        <dt>动画帧率</dt><dd id="s-fps">—</dd>
       </dl>
       <p class="note" id="s-error" hidden></p>
     </div>
@@ -725,19 +726,20 @@ function frame(now) {
   last = now;
   // under the finger the orb sits exactly where the pointer is (the stretch below carries the motion);
   // keyboard moves and resizes ease in
-  const k = st.drag && st.drag.moved ? 1 : 1 - Math.exp(-dt * 30);
+  const k = st.drag ? 1 : 1 - Math.exp(-dt * 30);
   const nx = st.x + (st.tx - st.x) * k, ny = st.y + (st.ty - st.y) * k;
   const ivx = (nx - st.x) / dt, ivy = (ny - st.y) / dt;
   st.x = nx; st.y = ny;
-  const kv = 1 - Math.exp(-dt * 12);
+  const kv = 1 - Math.exp(-dt * 24);
   st.vx += (ivx - st.vx) * kv; st.vy += (ivy - st.vy) * kv;
   let gx = 0, gy = 0;
   const sp = Math.hypot(st.vx, st.vy);
   if (!reduceMotion && sp > 1) { const m = Math.min(sp * 0.00015, 0.16); gx = st.vx / sp * m; gy = st.vy / sp * m; }
   const sub = 3, h = dt / sub;
   for (let i = 0; i < sub; i++) {
-    st.dvx += (260 * (gx - st.dx) - 12 * st.dvx) * h; st.dx += st.dvx * h;
-    st.dvy += (260 * (gy - st.dy) - 12 * st.dvy) * h; st.dy += st.dvy * h;
+    // stretch spring: same damping ratio (overshoot) as before, about 25 % quicker
+    st.dvx += (400 * (gx - st.dx) - 15 * st.dvx) * h; st.dx += st.dvx * h;
+    st.dvy += (400 * (gy - st.dy) - 15 * st.dvy) * h; st.dy += st.dvy * h;
     st.sv += ((reduceMotion ? 600 : 420) * (st.sTarget - st.s) - (reduceMotion ? 49 : 17) * st.sv) * h; st.s += st.sv * h;
   }
   st.touch += ((st.pressed ? 1 : 0) - st.touch) * (1 - Math.exp(-dt * (st.pressed ? 14 : 5)));
@@ -788,7 +790,7 @@ orb.addEventListener('pointerdown', (e) => {
   suppressClick = false;
   try { orb.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
   st.pressed = true; st.sTarget = 1.07;
-  st.drag = { id: e.pointerId, ox: e.clientX - st.tx, oy: e.clientY - st.ty, sx: e.clientX, sy: e.clientY, moved: false };
+  st.drag = { id: e.pointerId, ox: e.clientX - st.tx, oy: e.clientY - st.ty, sx: e.clientX, sy: e.clientY, tx0: st.tx, ty0: st.ty, moved: false };
   st.px = e.clientX; st.py = e.clientY;
   orb.classList.add('grabbing');
 });
@@ -796,7 +798,8 @@ orb.addEventListener('pointermove', (e) => {
   const d = st.drag;
   if (!d || d.id !== e.pointerId) return;
   if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > 5) { d.moved = true; hideHint(); }
-  if (d.moved) { st.tx = clamp(e.clientX - d.ox, 0, vw); st.ty = clamp(e.clientY - d.oy, 0, vh); }
+  // follows from the first move; the 5 px only decide whether this was a tap
+  st.tx = clamp(e.clientX - d.ox, 0, vw); st.ty = clamp(e.clientY - d.oy, 0, vh);
   st.px = e.clientX; st.py = e.clientY;
 });
 function endDrag(e) {
@@ -804,6 +807,7 @@ function endDrag(e) {
   if (!d || d.id !== e.pointerId) return;
   st.drag = null; st.pressed = false; st.sTarget = 1;
   suppressClick = d.moved;
+  if (!d.moved) { st.tx = d.tx0; st.ty = d.ty0; }   // a tap: ease back from the few px it wobbled
   orb.classList.remove('grabbing');
 }
 orb.addEventListener('pointerup', endDrag);
@@ -978,6 +982,9 @@ setInterval(() => {
   $('#s-holes').textContent = s.engine === 'snapshot' ? String(s.holes) : '—';
   $('#s-render').textContent = s.engine === 'snapshot' ? s.renderMs.toFixed(2) + ' ms' : s.engine === 'native' ? '只在高光变化时' : '静态';
   $('#s-live').textContent = s.engine === 'snapshot' ? String(s.live) : '—';
+  // Safari / iOS halve requestAnimationFrame in a cross-origin frame until the first tap; the SDK then draws
+  // from pointer input instead (counted here)
+  $('#s-fps').textContent = s.rafMs ? `${Math.round(1000 / s.rafMs)} fps` + (s.inputFrames ? ` · 输入补帧 ${s.inputFrames}` : '') : '—';
   const err = $('#s-error');
   err.hidden = !s.error;
   err.textContent = s.error ? '截图失败：' + s.error : '';

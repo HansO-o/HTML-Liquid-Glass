@@ -145,7 +145,7 @@ LiquidGlass.refresh()      // 立即重新截图（改了 canvas 像素等观察
 LiquidGlass.destroyAll()
 LiquidGlass.engine         // 当前引擎
 LiquidGlass.supports       // { native, snapshot, css }
-LiquidGlass.stats          // 截图次数、耗时等
+LiquidGlass.stats          // 截图次数、耗时、融合背板、动画帧间隔（rafMs）等
 LiquidGlass.presets / LiquidGlass.defaults
 ```
 
@@ -182,10 +182,15 @@ LiquidGlass.presets / LiquidGlass.defaults
 
 ### 融合
 
-每帧测量所有玻璃。满足**同一层**（定位方式和 `z-index` 相同）、**同一种材质**（`frost / sat / tint / dim / disp` 相同）、双方都开着 `merge`、距离小于 `blend` 这几个条件时，它们会组成一组：
+每帧测量所有玻璃。满足下面这些条件时，它们会组成一组：
+
+- **同一层**：同一个父元素下的兄弟元素，定位方式和 `z-index` 相同；
+- **同一种材质**：`frost / sat / tint / dim / disp` 相同，双方都开着 `merge`，距离小于 `blend`；
+- **正常显示**：可见、不透明（`opacity` 为 1），只有平移和等比缩放（旋转、不等比缩放的玻璃不融合）；
+- 最下面那块玻璃没有裁剪自己的溢出（`overflow` 为 `visible`），而且这几块玻璃之间（按绘制顺序）没有同一层的其他元素压在它们的范围里，否则那个元素会在上面的玻璃里不经模糊地露出来。
 
 - 形状：用多项式 smooth-min 把几个圆角矩形的距离场并成一个形状。靠近时出现液体桥，重叠时共用一块背板，重叠处没有内边缘。
-- **共用背板**：SDK 在这一组玻璃的下面插入一个元素（`data-lg-ignore`，和玻璃同一层，紧挨在最下面那块玻璃之前），由它显示整个融合形状下面的页面；玻璃元素自己的 backdrop-filter 在融合期间关掉，所以上面的玻璃不会把下面的玻璃再过滤一遍。
+- **共用背板**：SDK 在最下面那块玻璃里面（紧跟在它的画布后面，`z-index: -2`）放一个元素，由它显示整个融合形状下面的页面。它和玻璃一起被裁剪、滚动和变换，也不会插进页面自己的元素之间（不影响 `:first-child`、`+` 这类选择器）。玻璃元素自己的 backdrop-filter 在融合期间关掉，所以上面的玻璃不会把下面的玻璃再过滤一遍；放背板的那块玻璃的 CSS 背景色这时由它的画布来画（融合结束后原样恢复），免得被背板再过滤一次。
   - native 引擎：背板是一个 SVG 背景滤镜，位移图按融合后的轮廓用同一套光学模型生成，浏览器实时折射页面。
   - snapshot 引擎：背板是同样参数的 CSS 背景滤镜，裁成融合后的轮廓；边缘那圈折射照旧由画布从快照绘制，和单块玻璃完全一样。
   - 两种引擎下背板过滤的都是**实时页面**：融合不需要截图，玻璃后面的画面也不会因为融合而变成快照。
@@ -210,6 +215,7 @@ npx http-server .   # 或 python3 -m http.server
 - 跨域图片需要 `crossorigin="anonymous"` 才能进快照；网页字体默认不内嵌（`embedFonts: false`），快照里可能退回系统字体。由于只用于边缘折射，通常看不出来。
 - 融合和折射几何不考虑元素的旋转（`translate`、`scale` 没问题）。
 - 玻璃的投影会超出元素边界，祖先元素上的 `overflow: hidden` 会把它裁掉。
+- Safari 和 iOS / iPadOS 上的所有浏览器，在**跨域 iframe** 里（比如嵌在别的网站或预览窗口里），用户第一次轻点或点击之前会把 `requestAnimationFrame` 降到 30 fps，而且拖动不算点击（[WebKit 170534](https://bugs.webkit.org/show_bug.cgi?id=170534)、[213344](https://bugs.webkit.org/show_bug.cgi?id=213344)）。这时 SDK 改由指针移动驱动帧：每次 `pointermove` 先运行页面排队的动画回调，再绘制玻璃，每次屏幕刷新最多一帧，拖动仍是满帧率。不在跨域 iframe 里、Chromium、或者用户已经点过一下时，这个机制不会启用。
 - 尚未在真实的 Safari / iOS 设备上完整测试，欢迎反馈。
 
 ## 浏览器支持
