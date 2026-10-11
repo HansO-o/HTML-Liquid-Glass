@@ -717,6 +717,9 @@ function adaptColor(el, glass, state) {
 const navState = { dark: false };
 
 let last = performance.now();
+let warm = 0;
+const startWarmUp = () => { if (!st.drag) warm = 6; };
+window.addEventListener('load', () => (window.requestIdleCallback ? requestIdleCallback(startWarmUp, { timeout: 1500 }) : setTimeout(startWarmUp, 300)));
 function frame(now) {
   const dt = clamp((now - last) / 1000, 1 / 240, 1 / 30);
   last = now;
@@ -742,7 +745,15 @@ function frame(now) {
   // glass does not have to be repainted every frame
   const touchX = clamp(st.px - st.x, -D / 2, D / 2), touchY = clamp(st.py - st.y, -D / 2, D / 2);
 
-  const F = deform(), s = st.s;
+  let F = deform(), s = st.s;
+  // warm-up right after load: the first press (scale) and the first squash (non-uniform matrix) make the GPU
+  // compile a dozen shader programs, which hitches the first drag of a browser session. Doing both once,
+  // too small to see, gets that over with before the user touches the orb
+  if (warm > 0) {
+    warm--;
+    if (warm >= 3) s *= 1.002;
+    else F = [F[0] + 0.002, F[1] + 0.001, F[2] + 0.001, F[3] - 0.002];   // stretch along a diagonal, like a drag
+  }
   orb.style.transform = `translate3d(${(st.x - D / 2).toFixed(2)}px, ${(st.y - D / 2).toFixed(2)}px, 0) ` +
     `matrix(${(F[0] * s).toFixed(5)}, ${(F[1] * s).toFixed(5)}, ${(F[2] * s).toFixed(5)}, ${(F[3] * s).toFixed(5)}, 0, 0)`;
   orbGlass.setLight(st.touch < 0.005 ? 0 : st.touch, touchX, touchY);
@@ -954,6 +965,7 @@ try { stored = localStorage.getItem('lg-sdk-panel'); } catch (err) { stored = nu
 setPanel(stored === null ? vw > 900 : stored === '1');
 
 setInterval(() => {
+  if ($('#panel').hidden) return;   // nobody sees the numbers
   const s = LiquidGlass.stats;
   $('#s-engine').textContent = ENGINE_NAME[s.engine] || '—';
   $('#s-glasses').textContent = String(s.glasses);

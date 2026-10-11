@@ -1986,7 +1986,6 @@ class Manager {
     const raf = global.requestAnimationFrame.bind(global), caf = global.cancelAnimationFrame.bind(global);
     const M = this;
     this.raf = raf;
-    this.caf = caf;
     global.requestAnimationFrame = function requestAnimationFrame(cb) {
       if (typeof cb !== 'function') return raf(cb);
       return raf(function (t) {
