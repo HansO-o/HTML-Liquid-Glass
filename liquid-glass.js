@@ -1040,7 +1040,9 @@ class Glass {
 
   /** soft light under a point: amount 0..1, x / y in px from the element centre */
   setLight(amt, x, y) {
-    if (Math.abs(amt - this.touch.amt) < 1e-3 && x === this.touch.x && y === this.touch.y) return;
+    const T = this.touch;
+    // nothing to redraw while the light stays off, or when it moves by less than 1/64 px
+    if (Math.abs(amt - T.amt) < 1e-3 && ((amt < 1e-3 && T.amt < 1e-3) || (Math.abs(x - T.x) < 0.016 && Math.abs(y - T.y) < 0.016))) return;
     this.touch.amt = amt; this.touch.x = x; this.touch.y = y;
     this.dirty = true;
     const G = this.geom;
@@ -1059,7 +1061,7 @@ class Glass {
     const on = !!(this.p.pointer || this.p.button);
     if (on && !this.ptr) {
       // the pointer is kept in page coordinates and placed on the glass where the glass is drawn this frame
-      // (stepPointer), so the light stays under the finger while the glass is dragged
+      // (stepLight), so the light stays under the finger while the glass is dragged
       const st = this.ptr = { over: false, down: false, cx: 0, cy: 0 };
       const pos = (e) => { st.cx = e.clientX; st.cy = e.clientY; };
       st.h = {
@@ -1077,13 +1079,19 @@ class Glass {
       this.setLight(0, 0, 0);
     }
   }
-  stepPointer(dt) {
+  // the light, after measureFrame: it sits where the pointer is on the glass as drawn this frame
+  stepLight(dt) {
     const st = this.ptr;
     if (!st) return;
     const target = st.down ? 1 : st.over ? 0.45 : 0;
     let a = this.touch.amt + (target - this.touch.amt) * (1 - Math.exp(-dt * (target > this.touch.amt ? 14 : 5)));
     if (Math.abs(a - target) < 0.003) a = target;
     this.setLight(a, st.cx - this.frame.cx, st.cy - this.frame.cy);
+  }
+  // the press, before measureFrame: its scale is part of where the glass is this frame
+  stepPress(dt) {
+    const st = this.ptr;
+    if (!st) return;
     if (this.p.button) {
       const pt = st.down && !(this.drag && this.drag.moved) ? 1 : 0;
       let pr = this.press + (pt - this.press) * (1 - Math.exp(-dt * 18));
@@ -2096,7 +2104,7 @@ class Manager {
         if (M.tickT === t && M.rafId) {
           caf(M.rafId);
           M.rafId = raf(M.tick);
-          try { M.frame(t); } catch (err) { console.warn('[LiquidGlass]', err); }
+          try { M.rerun(t); } catch (err) { console.warn('[LiquidGlass]', err); }
         }
       }
     };
@@ -2153,6 +2161,15 @@ class Manager {
     }, { passive: true });
   }
 
+  // a page callback ran after this frame's glass work: redo it, but only if that callback moved some glass
+  rerun(t) {
+    for (const g of this.glasses) {
+      if (!g.rect || !g.el.isConnected) continue;
+      const r = g.el.getBoundingClientRect(), o = g.rect;
+      if (r.left !== o.left || r.top !== o.top || r.width !== o.width || r.height !== o.height) { this.frame(t); return; }
+    }
+  }
+
   tick(now) {
     const d = now - this.lastRafT;
     this.lastRafT = now;
@@ -2170,7 +2187,8 @@ class Manager {
     for (const g of this.glasses.slice()) if (!g.el.isConnected) g.destroy();
     const t0 = performance.now();
     // pass 1: positions and layers
-    for (const g of this.glasses) { g.measureFrame(); g.stepPointer(dt); }
+    for (const g of this.glasses) g.stepPress(dt);
+    for (const g of this.glasses) { g.measureFrame(); g.stepLight(dt); }
     for (const pl of this.plates.values()) pl.measure();
     // pass 2: who fuses with whom (same layer, closer than blend), who just overlaps (a hole). Fusing needs
     // the WebGL highlights; in the snapshot engine also the snapshot the rim is refracted from
