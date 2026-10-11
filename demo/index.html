@@ -494,7 +494,7 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
 
     <div class="grp">
       <div class="lbl">玻璃参数</div>
-      <p class="note">圆形按钮和新建的卡片、胶囊、圆形共用这组参数；辉光和下面的叠加方式只管圆形按钮。</p>
+      <p class="note">页面上所有玻璃都用这组参数：导航、图片上的卡片、圆形按钮、新建的面板和收起后的参数按钮，参数面板自己除外。辉光和下面的叠加方式只管圆形按钮。</p>
       <div class="rows" id="rows"></div>
       <div class="seg" id="seg-contrast">
         <button type="button" data-v="off" aria-pressed="true">直接叠加</button>
@@ -514,7 +514,7 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
         <button type="button" class="ghost" data-kind="frosted">磨砂</button>
         <button type="button" class="ghost" data-kind="lens">放大镜</button>
       </div>
-      <p class="note">只是往页面里插入一个带 <code>data-liquid-glass</code> 的元素，SDK 自动接管，拖动也是 SDK 自带的。卡片、胶囊、圆形用上面的玻璃参数（默认透明、不磨砂），是同一种材质，拖到一起会融合；深色、磨砂、放大镜用各自的预设。点 × 关闭。</p>
+      <p class="note">只是往页面里插入一个带 <code>data-liquid-glass</code> 的元素，SDK 自动接管，拖动也是 SDK 自带的。新建的面板也跟着上面的玻璃参数，深色、磨砂、放大镜只保留各自预设的颜色和曲率。卡片、胶囊、圆形是同一种材质，拖到一起会融合。点 × 关闭。</p>
     </div>
 
     <div class="grp">
@@ -658,6 +658,20 @@ function glassOpts() {
   return { dim: P.dim / 100, bezel: P.bezel / 100, refract: P.refract / 100, disp: P.disp / 100, frost: P.frost, spec: P.spec / 100 };
 }
 const orbGlass = LiquidGlass.create(orb, Object.assign(glassOpts(), { adaptive: true, contrast: 'off', mask: orbMask }));
+// every other glass on the page follows the sheet too (except the sheet itself, which has to stay readable):
+// each keeps its own preset and switches, the sheet sets dim, bezel, refract, disp, frost and spec
+const SHEET_KEYS = ['dim', 'bezel', 'refract', 'disp', 'frost', 'spec'];
+function followSheet(el) {
+  if (el.dataset.baseGlass == null) {
+    el.dataset.baseGlass = el.getAttribute('data-liquid-glass').split(';').map((t) => t.trim())
+      .filter((t) => t && !SHEET_KEYS.includes(t.split(':')[0].trim())).join('; ');
+  }
+  const o = glassOpts();
+  el.setAttribute('data-liquid-glass', [el.dataset.baseGlass, ...SHEET_KEYS.map((k) => k + ': ' + +o[k].toFixed(3))].filter(Boolean).join('; '));
+}
+const followers = () => document.querySelectorAll('[data-liquid-glass]:not(#panel)');
+// runs before the SDK scans the page, so nothing starts out with its old look
+followers().forEach(followSheet);
 
 // ------------------------------------------------------------ orb motion (springs, squash and stretch)
 const st = {
@@ -838,30 +852,25 @@ const ICONS = {
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>',
 };
 const KINDS = {
-  card: { cls: 'gp-card adapt', flags: 'draggable: true; pointer: true; adaptive: true',
+  card: { cls: 'gp-card adapt', glass: 'clear; draggable: true; pointer: true; adaptive: true',
     html: `<div class="row-h"><h4>通知</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>这块面板只是一个带 data-liquid-glass 的 div，插进页面就自动变成了玻璃。拖动它试试。</p>` },
-  pill: { cls: 'gp-pill adapt', flags: 'draggable: true; button: true; adaptive: true',
+  pill: { cls: 'gp-pill adapt', glass: 'clear; draggable: true; button: true; adaptive: true',
     html: `<button type="button" class="ib" aria-label="上一首">${ICONS.prev}</button><button type="button" class="ib" aria-label="播放">${ICONS.play}</button><button type="button" class="ib" aria-label="下一首">${ICONS.next}</button><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button>` },
-  round: { cls: 'gp-round adapt', flags: 'draggable: true; button: true; adaptive: true',
+  round: { cls: 'gp-round adapt', glass: 'clear; draggable: true; button: true; adaptive: true',
     html: `<button type="button" class="x" aria-label="关闭面板">${ICONS.plus}</button>` },
   dark: { cls: 'gp-dark', glass: 'dark; draggable: true; pointer: true',
-    html: `<div class="row-h"><h4>深色面板</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>preset: dark，压暗 35%。白字压在任何背景上都清楚。</p>` },
+    html: `<div class="row-h"><h4>深色面板</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>preset: dark，深色底配白字。压暗、磨砂这些跟着参数面板走。</p>` },
   frosted: { cls: 'gp-frosted adapt', glass: 'frosted; draggable: true; pointer: true; adaptive: true',
-    html: `<div class="row-h"><h4>磨砂面板</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>preset: frosted，背后的内容只剩颜色。</p>` },
+    html: `<div class="row-h"><h4>磨砂面板</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>preset: frosted，饱和度和提亮更高。磨砂程度跟着参数面板走，调大就只剩颜色。</p>` },
   lens: { cls: 'gp-lens', glass: 'lens; draggable: true', html: '' },
 };
-// card, pill and round take the sheet's glass settings (the orb's material), so they fuse with each other
-function sheetGlass(K) {
-  const o = glassOpts();
-  return 'clear; ' + Object.keys(o).map((k) => k + ': ' + +o[k].toFixed(3)).join('; ') + '; ' + K.flags;
-}
 let spawnCount = 0;
 function spawn(kind) {
   const K = KINDS[kind];
   const el = document.createElement('div');
   el.className = 'gp spawned ' + K.cls;
-  if (K.flags) el.dataset.kind = kind;
-  el.setAttribute('data-liquid-glass', K.flags ? sheetGlass(K) : K.glass);
+  el.setAttribute('data-liquid-glass', K.glass);
+  followSheet(el);
   el.innerHTML = K.html;
   // lay new panels out in a loose grid so they do not pile up
   const n = spawnCount++;
@@ -894,7 +903,7 @@ let applyTimer = 0;
 function applyGlassNow() {
   clearTimeout(applyTimer);
   orbGlass.set(glassOpts());
-  document.querySelectorAll('.spawned[data-kind]').forEach((el) => el.setAttribute('data-liquid-glass', sheetGlass(KINDS[el.dataset.kind])));
+  followers().forEach(followSheet);
 }
 function applyGlass() {
   clearTimeout(applyTimer);
