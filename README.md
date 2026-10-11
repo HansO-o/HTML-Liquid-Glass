@@ -203,8 +203,25 @@ LiquidGlass.presets / LiquidGlass.defaults
 
 ```bash
 npx http-server .   # 或 python3 -m http.server
-# 打开 http://localhost:8080/demo/
+# 官网 http://localhost:8080/ ，完整演示 http://localhost:8080/demo/
 ```
+
+## 官网与部署到 Cloudflare
+
+仓库根目录就是一个能直接部署的静态站点：`index.html` 是官网首页（玻璃导航、可拖动的玻璃球、融合试玩、各种材质），`demo/` 是带参数面板的完整演示，`liquid-glass.js` 是 SDK 本身，`404.html` 是找不到页面时的玻璃卡片。
+
+用 Cloudflare Workers（静态资源）部署，`wrangler.jsonc` 已经配好：
+
+```bash
+npx wrangler login
+npx wrangler deploy
+```
+
+部署后地址是 `https://liquid-glass.<你的子域>.workers.dev`，可以在 Cloudflare 控制台给它绑定自己的域名。`.assetsignore` 里列出的文件（`.git`、`README.md`、`wrangler.jsonc` 等）不会上传；`_headers` 给 `liquid-glass.js` 加了 1 小时缓存和跨域头，别的网站也能直接引用它。
+
+也可以用 Cloudflare Pages：在控制台连接这个 GitHub 仓库，构建命令留空，输出目录填 `/`。
+
+> 演示最好以独立页面打开。嵌在别的网站的 iframe 里时，Safari 和 iPhone / iPad 上的浏览器在第一次轻点之前会把动画降到 30 fps（见「限制」），SDK 会改用手指移动来驱动帧。
 
 演示页包含：可拖动的圆形进度按钮（带弹簧形变）、每种预设的面板生成器、引擎 / 截图器 / 分辨率切换，以及 iframe 挖空、`data-lg-live` canvas、融合等示例。
 

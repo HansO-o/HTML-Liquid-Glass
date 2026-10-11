@@ -212,6 +212,8 @@ uniform vec4 uFuse[8];       // same-layer neighbours fused with this glass: cen
 uniform float uFuseR[8];
 uniform float uFuseTop[8];   // 1 when that neighbour is painted above this glass
 uniform vec4 uFuseTint[8];   // that neighbour's CSS background colour (straight alpha)
+uniform vec4 uFuseOpt[8];    // that neighbour's bezel, thickness, curve, spec
+uniform vec4 uFuseOpt2[8];   // that neighbour's shadow, ior, gap
 uniform int uFuseN;
 uniform vec4 uTintSelf;      // this glass's CSS background colour
 uniform float uOwnTint;      // 1 while this glass hosts the backplate: its CSS background is off, painted here
@@ -268,7 +270,7 @@ float boxSd(vec2 p, out vec2 n) { return rrSd(p, uHalf, uRad, n); }
 
 // smooth union with the fused neighbours (polynomial smin: shapes only start to melt within uBlend px).
 // Mirrored on the CPU by UnionField, which builds the shared backplate's refraction map
-float unionSd(vec2 p, float sdSelf, inout vec2 n, inout float mE, inout vec4 tint) {
+float unionSd(vec2 p, float sdSelf, inout vec2 n, inout float mE, inout vec4 tint, inout vec4 opt, inout vec4 opt2) {
   float sd = sdSelf;
   float k = max(uBlend, 1.0);
   for (int i = 0; i < 8; i++) {
@@ -280,6 +282,8 @@ float unionSd(vec2 p, float sdSelf, inout vec2 n, inout float mE, inout vec4 tin
     n = normalize(mix(nj, n, h) + vec2(1e-5));
     mE = mix(min(uFuse[i].z, uFuse[i].w), mE, h);
     tint = mix(uFuseTint[i], tint, h);
+    opt = mix(uFuseOpt[i], opt, h);     // glass with different optics melts smoothly too
+    opt2 = mix(uFuseOpt2[i], opt2, h);
   }
   return sd;
 }
@@ -298,56 +302,63 @@ void main() {
   float sdSelf = boxSd(p, outward);
   float sd = sdSelf, mE = m;
   float bridge = 0.0;          // part of this pixel that no glass box (and so no element background) covers
+  float share = 1.0;           // how much of this pixel this glass draws (fused glass splits the merged shape)
   float ownCov = clamp(0.5 - sdSelf * uDpr, 0.0, 1.0);
   vec4 tintE = uTintSelf;
+  vec4 opt = vec4(uBezel, uThick, uK, uSpec);   // optics, blended across bridges while fused
+  vec4 opt2 = vec4(uShadow, uIor, uGap, 0.0);
   if (uFuseN > 0) {
     // who draws this pixel: own interior is ours; an overlap belongs to the glass painted lowest, so the
     // highlights sit under the content of every glass in the stack; outside every box, the nearest glass
-    // draws the bridge. The page behind the merged shape comes from the shared backplate element
-    bool belowOther = false, inOther = false, closer = false;
+    // draws the bridge. The page behind the merged shape comes from the shared backplate element.
+    // The share is soft (a 2 css px ramp) and the shares of neighbouring canvases add up to 1: each canvas has
+    // its own pixel grid, so a hard yes/no would leave a seam of double (or no) highlight and shadow
+    float wIn = 1.0, wOut = 1.0;
     float uncovered = clamp(0.5 + sdSelf * uDpr, 0.0, 1.0);
     for (int i = 0; i < 8; i++) {
       if (i >= uFuseN) break;
       vec2 nj;
       float sj = rrSd(p - uFuse[i].xy, uFuse[i].zw, uFuseR[i], nj);
-      if (sj < 0.0) { inOther = true; if (uFuseTop[i] < 0.5) belowOther = true; }
-      // equally close: the glass painted lower draws it (UnionField decides the same way)
-      float dd = sj - sdSelf;
-      if (dd < -1e-3 || (abs(dd) <= 1e-3 && uFuseTop[i] < 0.5)) closer = true;
+      float outJ = clamp(0.5 + sj * 0.5, 0.0, 1.0);
+      if (uFuseTop[i] < 0.5) wIn *= outJ;                         // inside a glass painted lower: that one draws
+      wOut *= outJ * clamp(0.5 + (sj - sdSelf) * 0.5, 0.0, 1.0);    // outside every box: the nearest draws
       uncovered *= clamp(0.5 + sj * uDpr, 0.0, 1.0);
     }
-    bool own = sdSelf < 0.0 ? !(inOther && belowOther) : (!inOther && !closer);
-    if (!own) { o = vec4(0.0); return; }
-    sd = unionSd(p, sdSelf, outward, mE, tintE);
+    float inSelf = clamp(0.5 - sdSelf * 0.5, 0.0, 1.0);
+    share = inSelf * wIn + (1.0 - inSelf) * wOut;
+    if (share <= 0.0) { o = vec4(0.0); return; }
+    sd = unionSd(p, sdSelf, outward, mE, tintE, opt, opt2);
     bridge = uncovered;
   }
 
-  vec2 ps = p - vec2(0.21, 1.0) * uShadowGeom.x;
+  // the drop shadow's size follows the (blended) size of the glass, as shadowGeom() does on the CPU
+  vec3 shG = uFuseN > 0 ? vec3(min(mE * 0.12, 10.0), min(mE * 0.2, 16.0), min(mE * 0.04, 4.0)) : uShadowGeom;
+  vec2 ps = p - vec2(0.21, 1.0) * shG.x;
   vec2 sn;
   float mS = m;
-  vec4 tS = vec4(0.0);
+  vec4 tS = vec4(0.0), oS = vec4(0.0), oS2 = vec4(0.0);
   float sds = boxSd(ps, sn);
-  if (uFuseN > 0) sds = unionSd(ps, sds, sn, mS, tS);
-  sds += uShadowGeom.z;
-  float sig = uShadowGeom.y;
-  float sh = uShadow * (1.0 + 0.7 * uPress) * (0.6 * (1.0 - smoothstep(-sig, sig * 1.2, sds)) + 0.4 * (1.0 - smoothstep(-sig, sig * 3.6, sds)));
+  if (uFuseN > 0) sds = unionSd(ps, sds, sn, mS, tS, oS, oS2);
+  sds += shG.z;
+  float sig = shG.y;
+  float sh = opt2.x * (1.0 + 0.7 * uPress) * (0.6 * (1.0 - smoothstep(-sig, sig * 1.2, sds)) + 0.4 * (1.0 - smoothstep(-sig, sig * 3.6, sds)));
 
   float aa = clamp(0.5 - sd * uDpr, 0.0, 1.0);
-  if (aa <= 0.0) { o = vec4(0.0, 0.0, 0.0, sh); return; }
+  if (aa <= 0.0) { o = vec4(0.0, 0.0, 0.0, sh) * share; return; }
 
   m = mE;
   float e = max(-sd, 0.0);
-  float w = max(uBezel * m, 0.5);
+  float w = max(opt.x * m, 0.5);
   float t = clamp(e / w, 0.0, 1.0);
   float omt = 1.0 - t;
-  float base = max(1.0 - pow(omt, uK), 1e-5);
-  float h = pow(base, 1.0 / uK);
-  float dhdt = pow(base, 1.0 / uK - 1.0) * pow(omt, uK - 1.0);
-  float T = uThick * m;
+  float base = max(1.0 - pow(omt, opt.z), 1e-5);
+  float h = pow(base, 1.0 / opt.z);
+  float dhdt = pow(base, 1.0 / opt.z - 1.0) * pow(omt, opt.z - 1.0);
+  float T = opt.y * m;
   float slope = min(dhdt / w * T, 8.0);
   vec3 N = normalize(vec3(outward * slope, 1.0));
-  vec3 Tr = refract(vec3(0.0, 0.0, -1.0), N, 1.0 / uIor);
-  float depth = T * (uGap + (1.0 - uGap) * h);
+  vec3 Tr = refract(vec3(0.0, 0.0, -1.0), N, 1.0 / opt2.y);
+  float depth = T * (opt2.z + (1.0 - opt2.z) * h);
   vec2 d = Tr.xy / max(-Tr.z, 0.15) * depth;
 
   // the refracting rim comes from the snapshot; inside it the live page shows through (CSS backdrop-filter)
@@ -379,10 +390,10 @@ void main() {
   float fres = pow(1.0 - N.z, 5.0) * (0.3 + 0.7 * side);
   float rimLine = exp(-e / 1.1);
   float rimSoft = exp(-e / (m * 0.10));
-  float hi = uSpec * (0.9 * rimLine * (0.22 + 0.78 * side) + 0.3 * fres
+  float hi = opt.w * (0.9 * rimLine * (0.22 + 0.78 * side) + 0.3 * fres
            + 0.42 * blinn(N, uLight) + 0.18 * blinn(N, -uLight) + 0.05 * rimSoft * side);
   // no refraction over holes: a plain glassmorphism bevel stands in for it
-  hi += holeRim * uSpec * (0.30 * (1.0 - t) * (0.45 + 0.55 * side) + 0.35 * rimLine);
+  hi += holeRim * opt.w * (0.30 * (1.0 - t) * (0.45 + 0.55 * side) + 0.35 * rimLine);
   vec2 dt = p - uTouch;
   hi += uTouchAmt * 0.12 * exp(-dot(dt, dt) / (m * m * 0.9)) + uPress * 0.04;
   hi = clamp(hi + uTint, 0.0, 1.0);
@@ -411,13 +422,13 @@ void main() {
   vec4 tintP = vec4(tintE.rgb * tintE.a, tintE.a) * bridge + vec4(uTintSelf.rgb * uTintSelf.a, uTintSelf.a) * ownCov * uOwnTint;
   over += tintP * (1.0 - over.a);
   vec4 lens = mix(over, vec4(mix(col * (1.0 - kd), vec3(1.0), hiT), 1.0), rim);
-  o = lens * aa + vec4(0.0, 0.0, 0.0, sh) * (1.0 - aa);
+  o = (lens * aa + vec4(0.0, 0.0, 0.0, sh) * (1.0 - aa)) * share;
 }`;
 
 const UNIFORMS = ['uSnap', 'uHaloTex', 'uSnapSize', 'uCenterSnap', 'uCanvasPx', 'uHalf', 'uLight', 'uTouch', 'uShadowGeom', 'uA',
   'uSnapScale', 'uDpr', 'uRad', 'uPad', 'uBezel', 'uK', 'uThick', 'uIor', 'uGap', 'uDisp', 'uFrost', 'uSpec',
   'uTint', 'uSat', 'uDim', 'uShadow', 'uTouchAmt', 'uHalo', 'uGlyphDark', 'uNative', 'uOther', 'uOtherR', 'uOtherN',
-  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uBlend', 'uPress'];
+  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseOpt', 'uFuseOpt2', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uBlend', 'uPress'];
 
 class Renderer {
   constructor(canvas) {
@@ -563,6 +574,8 @@ class Renderer {
     const fr = this.fuseRBuf || (this.fuseRBuf = new Float32Array(8));
     const ft = this.fuseTBuf || (this.fuseTBuf = new Float32Array(8));
     const fc = this.fuseCBuf || (this.fuseCBuf = new Float32Array(32));
+    const fo = this.fuseOBuf || (this.fuseOBuf = new Float32Array(32));
+    const fo2 = this.fuseO2Buf || (this.fuseO2Buf = new Float32Array(32));
     const sA = g.frameScale();
     for (let i = 0; i < fuse.length; i++) {
       const o = fuse[i];
@@ -572,11 +585,16 @@ class Renderer {
       fr[i] = Math.min(o.geom.r * so, fa[i * 4 + 2], fa[i * 4 + 3]);
       ft[i] = g.paintsBelow(o) ? 1 : 0;
       fc.set(o.tint, i * 4);
+      const Q = o.p;
+      fo[i * 4] = Q.bezel; fo[i * 4 + 1] = Q.refract * 0.9; fo[i * 4 + 2] = Q.curve; fo[i * 4 + 3] = Q.spec;
+      fo2[i * 4] = Q.shadow; fo2[i * 4 + 1] = Q.ior; fo2[i * 4 + 2] = Q.gap; fo2[i * 4 + 3] = 0;
     }
     gl.uniform4fv(U.uFuse, fa);
     gl.uniform1fv(U.uFuseR, fr);
     gl.uniform1fv(U.uFuseTop, ft);
     gl.uniform4fv(U.uFuseTint, fc);
+    gl.uniform4fv(U.uFuseOpt, fo);
+    gl.uniform4fv(U.uFuseOpt2, fo2);
     gl.uniform1i(U.uFuseN, fuse.length);
     gl.uniform4fv(U.uTintSelf, g.tint);
     gl.uniform1f(U.uOwnTint, g.bgHold ? 1 : 0);
@@ -1507,6 +1525,8 @@ class UnionField {
     this.cx = F(); this.cy = F(); this.ax = F(); this.ay = F(); this.r = F(); this.m = F(); this.k = F();
     this.sd = F(); this.nx = F(); this.ny = F();
     this.P = D.map((d) => d.P);
+    this.opt = D.map((d) => [d.P.bezel, d.P.refract, d.P.curve, d.P.ior, d.P.gap]);
+    this.uP = { bezel: 0, refract: 0, curve: 0, ior: 0, gap: 0, spec: 1 };   // optics at the last point
     this.nb = D.map((d) => Int32Array.from(d.nb.map((e) => D.indexOf(e))));
     D.forEach((d, i) => {
       this.cx[i] = d.cx; this.cy[i] = d.cy; this.ax[i] = d.hw - d.r; this.ay[i] = d.hh - d.r;
@@ -1539,6 +1559,8 @@ class UnionField {
     }
     const o = inside >= 0 ? inside : near, k = this.k[o], nb = this.nb[o];
     let sd = this.sd[o], nx = this.nx[o], ny = this.ny[o], m = this.m[o];
+    const oo = this.opt[o];
+    let b = oo[0], rf = oo[1], cv = oo[2], io = oo[3], gp = oo[4];
     for (let q = 0; q < nb.length; q++) {
       const j = nb[q], sj = this.sd[j];
       let h = 0.5 + 0.5 * (sj - sd) / k;
@@ -1548,7 +1570,12 @@ class UnionField {
       const il = 1 / Math.sqrt(ux * ux + uy * uy);
       nx = ux * il; ny = uy * il;
       m = this.m[j] + (m - this.m[j]) * h;
+      const oj = this.opt[j];   // optics melt like the shape (as in the shader)
+      b = oj[0] + (b - oj[0]) * h; rf = oj[1] + (rf - oj[1]) * h; cv = oj[2] + (cv - oj[2]) * h;
+      io = oj[3] + (io - oj[3]) * h; gp = oj[4] + (gp - oj[4]) * h;
     }
+    const uP = this.uP;
+    uP.bezel = b; uP.refract = rf; uP.curve = cv; uP.ior = io; uP.gap = gp;
     this.usd = sd; this.unx = nx; this.uny = ny; this.um = m; this.uo = o;
     return sd;
   }
@@ -1731,7 +1758,7 @@ class Plate {
             if (a <= 0) continue;
             const k = j * nw + i;
             data[k * 4 + 2] = a >= 1 ? 255 : Math.round(255 * a);
-            const P = U.P[U.uo];
+            const P = U.uP;
             if (-sd >= Math.max(P.bezel * U.um, 0.5)) continue;   // past the bezel the glass is flat
             const o = opticsAt(sd, U.unx, U.uny, U.um, P, false);
             band.push(k); bdx.push(o.dx); bdy.push(o.dy);

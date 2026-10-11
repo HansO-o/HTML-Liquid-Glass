@@ -1,0 +1,12 @@
+// Cloudflare Workers, static assets only: `npx wrangler deploy` uploads this folder as the site
+// (index.html = landing page, demo/ = full demo, liquid-glass.js = the SDK). Files listed in
+// .assetsignore are not uploaded.
+{
+  "name": "liquid-glass",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": ".",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  }
+}
