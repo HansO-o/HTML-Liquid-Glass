@@ -337,7 +337,7 @@ p code, li code, td code { background: #e8eaef; padding: 1px 6px; border-radius:
   <section id="merge">
     <h2>靠近就融合</h2>
     <p>同一层（相同 z-index、相同定位方式）、同一种材质的玻璃不会互相压出边缘。两块玻璃的距离小于 <code>blend</code>（默认 24px）时，形状开始像水滴一样连在一起；叠在一起时共用一块背板，重叠的部分没有内边缘，高光和投影也只沿着整体的外轮廓走。</p>
-    <p>每个像素只由一块玻璃负责：自己的内部归自己，重叠部分归画在最上面的那块，两块之间的连接桥归离得近的那块。连接桥和重叠区从页面快照画成一整块玻璃，所以原生引擎在发生融合时也会临时拍快照。在参数面板里新建几块面板，把它们拖到一起试试；不想融合的元素设 <code>merge: false</code>。</p>
+    <p>融合以后，SDK 在这组玻璃下面放一块共用的背板，由它显示整个融合形状下面的页面，玻璃自己的背景滤镜先关掉。原生引擎里背板是按融合后的轮廓生成位移图的 SVG 滤镜，快照引擎里是裁成轮廓的 CSS 模糊；两种情况过滤的都是实时页面，所以融合不截图，玻璃后面的画面也不会变。高光和投影仍然每个像素只由一块玻璃负责：自己的内部归自己，重叠部分归画在最下面的那块，两块之间的连接桥归离得近的那块。在参数面板里新建几块面板，把它们拖到一起试试；不想融合的元素设 <code>merge: false</code>。</p>
   </section>
 
   <section id="refresh">
@@ -371,6 +371,8 @@ p code, li code, td code { background: #e8eaef; padding: 1px 6px; border-radius:
           <tr><td>中间平坦区域交给 CSS 模糊，WebGL 只算边缘一圈</td><td>着色器的重活只在几个像素宽的环上</td></tr>
           <tr><td>实时图层只在玻璃经过时上传自己那一小块</td><td>不重拍整页</td></tr>
           <tr><td>屏幕外的玻璃不绘制；所有玻璃共用一个 WebGL 上下文；大面板的投影范围有上限</td><td>面板再多、再大，开销也基本只和屏幕上的玻璃有关</td></tr>
+          <tr><td>融合用实时背板，不截图；背板的位移图只在玻璃相对位置变化时重建，按 1 个 CSS 像素一格生成，跳过离轮廓远的区域</td><td>拖着融合中的玻璃时每帧约几毫秒，静止或整组移动时为零</td></tr>
+          <tr><td>每帧的测量和绘制排在页面自己的动画回调之后；拖动时指针柔光固定在手指下</td><td>页面在动画循环里移动的玻璃当帧就画在新位置，不慢一帧；拖动中玻璃不用每帧重画</td></tr>
         </tbody>
       </table>
     </div>
@@ -658,7 +660,7 @@ const orbGlass = LiquidGlass.create(orb, Object.assign(glassOpts(), { adaptive: 
 // ------------------------------------------------------------ orb motion (springs, squash and stretch)
 const st = {
   x: 0, y: 0, tx: 0, ty: 0, vx: 0, vy: 0, dx: 0, dy: 0, dvx: 0, dvy: 0,
-  s: 1, sv: 0, sTarget: 1, pressed: false, touch: 0, touchX: 0, touchY: 0, drag: null,
+  s: 1, sv: 0, sTarget: 1, pressed: false, touch: 0, px: 0, py: 0, drag: null,
 };
 function placeInitial() {
   const article = $('.page').getBoundingClientRect();
@@ -668,6 +670,7 @@ function placeInitial() {
   const y = vw > 640 ? vh * 0.58 : vh - D / 2 - 140;
   st.x = st.tx = clamp(x, D / 2, vw - D / 2);
   st.y = st.ty = clamp(y, D / 2, vh - D / 2);
+  if (!$('#panel').hidden) { keepOrbClear(); st.x = st.tx; st.y = st.ty; }
 }
 function deform() {
   const m = Math.hypot(st.dx, st.dy);
@@ -717,7 +720,9 @@ let last = performance.now();
 function frame(now) {
   const dt = clamp((now - last) / 1000, 1 / 240, 1 / 30);
   last = now;
-  const k = 1 - Math.exp(-dt * 30);
+  // under the finger the orb sits exactly where the pointer is (the stretch below carries the motion);
+  // keyboard moves and resizes ease in
+  const k = st.drag && st.drag.moved ? 1 : 1 - Math.exp(-dt * 30);
   const nx = st.x + (st.tx - st.x) * k, ny = st.y + (st.ty - st.y) * k;
   const ivx = (nx - st.x) / dt, ivy = (ny - st.y) / dt;
   st.x = nx; st.y = ny;
@@ -733,11 +738,14 @@ function frame(now) {
     st.sv += ((reduceMotion ? 600 : 420) * (st.sTarget - st.s) - (reduceMotion ? 49 : 17) * st.sv) * h; st.s += st.sv * h;
   }
   st.touch += ((st.pressed ? 1 : 0) - st.touch) * (1 - Math.exp(-dt * (st.pressed ? 14 : 5)));
+  // the light sits where the finger is on the orb as drawn this frame: while dragging it stays put, so the
+  // glass does not have to be repainted every frame
+  const touchX = clamp(st.px - st.x, -D / 2, D / 2), touchY = clamp(st.py - st.y, -D / 2, D / 2);
 
   const F = deform(), s = st.s;
   orb.style.transform = `translate3d(${(st.x - D / 2).toFixed(2)}px, ${(st.y - D / 2).toFixed(2)}px, 0) ` +
     `matrix(${(F[0] * s).toFixed(5)}, ${(F[1] * s).toFixed(5)}, ${(F[2] * s).toFixed(5)}, ${(F[3] * s).toFixed(5)}, 0, 0)`;
-  orbGlass.setLight(st.touch < 0.005 ? 0 : st.touch, st.touchX, st.touchY);
+  orbGlass.setLight(st.touch < 0.005 ? 0 : st.touch, touchX, touchY);
 
   if (playing) {
     if (phase === 'run') { progress += dt / 7; if (progress >= 1) { progress = 1; phase = 'hold'; hold = 0; } }
@@ -770,7 +778,7 @@ orb.addEventListener('pointerdown', (e) => {
   try { orb.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
   st.pressed = true; st.sTarget = 1.07;
   st.drag = { id: e.pointerId, ox: e.clientX - st.tx, oy: e.clientY - st.ty, sx: e.clientX, sy: e.clientY, moved: false };
-  st.touchX = e.clientX - st.x; st.touchY = e.clientY - st.y;
+  st.px = e.clientX; st.py = e.clientY;
   orb.classList.add('grabbing');
 });
 orb.addEventListener('pointermove', (e) => {
@@ -778,7 +786,7 @@ orb.addEventListener('pointermove', (e) => {
   if (!d || d.id !== e.pointerId) return;
   if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > 5) { d.moved = true; hideHint(); }
   if (d.moved) { st.tx = clamp(e.clientX - d.ox, 0, vw); st.ty = clamp(e.clientY - d.oy, 0, vh); }
-  st.touchX = clamp(e.clientX - st.x, -D / 2, D / 2); st.touchY = clamp(e.clientY - st.y, -D / 2, D / 2);
+  st.px = e.clientX; st.py = e.clientY;
 });
 function endDrag(e) {
   const d = st.drag;
@@ -930,6 +938,14 @@ function setPanel(open) {
   $('#panel').hidden = !open;
   $('#p-open').hidden = open;
   try { localStorage.setItem('lg-sdk-panel', open ? '1' : '0'); } catch (err) { /* ignore */ }
+  if (open) keepOrbClear();
+}
+// the sheet must not end up on top of the orb: slide the orb beside it (above it on phones)
+function keepOrbClear() {
+  const r = $('#panel').getBoundingClientRect(), m = D / 2 + 12;
+  if (st.tx + m < r.left || st.tx - m > r.right || st.ty + m < r.top || st.ty - m > r.bottom) return;
+  if (r.left - m >= D / 2) st.tx = r.left - m;
+  else st.ty = clamp(r.top - m, D / 2, vh - D / 2);
 }
 $('#p-close').addEventListener('click', () => setPanel(false));
 $('#p-open').addEventListener('click', () => setPanel(true));

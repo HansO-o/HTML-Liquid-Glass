@@ -149,32 +149,40 @@ function blinnJS(nx, ny, nz, lx, ly) {
   il = 1 / Math.hypot(Hx, Hy, Hz); Hx *= il; Hy *= il; Hz *= il;
   return Math.pow(Math.max(nx * Hx + ny * Hy + nz * Hz, 0), 110);
 }
-function lensOptics(px, py, G, P) {
-  const s = boxSd(px, py, G.hw, G.hh, G.r);
-  const e = Math.max(-s.sd, 0);
-  const w = Math.max(P.bezel * G.m, 0.5);
+// refraction offset (and highlight) at a point that is sd px from the outline (negative inside), with outward
+// normal (onx, ony); m is the size the bezel and the thickness scale with
+function opticsAt(sd, onx, ony, m, P, wantHi) {
+  const e = Math.max(-sd, 0);
+  const w = Math.max(P.bezel * m, 0.5);
   const t = Math.min(e / w, 1), omt = 1 - t;
   const base = Math.max(1 - Math.pow(omt, P.curve), 1e-5);
   const h = Math.pow(base, 1 / P.curve);
   const dhdt = Math.pow(base, 1 / P.curve - 1) * Math.pow(omt, P.curve - 1);
-  const T = P.refract * 0.9 * G.m;
+  const T = P.refract * 0.9 * m;
   const slope = Math.min(dhdt / w * T, 8);
   const inv = 1 / Math.hypot(slope, 1);
-  const nx = s.nx * slope * inv, ny = s.ny * slope * inv, nz = inv;
+  const nx = onx * slope * inv, ny = ony * slope * inv, nz = inv;
   const eta = 1 / P.ior;
   const k = 1 - eta * eta * (1 - nz * nz);
   const c = eta * nz - Math.sqrt(Math.max(k, 0));
   const tz = -eta + c * nz;
   const depth = T * (P.gap + (1 - P.gap) * h);
   const f = depth / Math.max(-tz, 0.15);
-  const ld = s.nx * LX + s.ny * LY;
+  if (!wantHi) return { dx: c * nx * f, dy: c * ny * f, hi: 0 };
+  const ld = onx * LX + ony * LY;
   const side = Math.pow(Math.max(ld, 0), 1.5) + 0.6 * Math.pow(Math.max(-ld, 0), 1.5);
   const fres = Math.pow(1 - nz, 5) * (0.3 + 0.7 * side);
   const rimLine = Math.exp(-e / 1.1);
-  const rimSoft = Math.exp(-e / (G.m * 0.1));
+  const rimSoft = Math.exp(-e / (m * 0.1));
   const hi = P.spec * (0.9 * rimLine * (0.22 + 0.78 * side) + 0.3 * fres +
     0.42 * blinnJS(nx, ny, nz, LX, LY) + 0.18 * blinnJS(nx, ny, nz, -LX, -LY) + 0.05 * rimSoft * side);
-  return { sd: s.sd, dx: c * nx * f, dy: c * ny * f, hi };
+  return { dx: c * nx * f, dy: c * ny * f, hi };
+}
+function lensOptics(px, py, G, P) {
+  const s = boxSd(px, py, G.hw, G.hh, G.r);
+  const o = opticsAt(s.sd, s.nx, s.ny, G.m, P, true);
+  o.sd = s.sd;
+  return o;
 }
 // the drop shadow stays small on big panels
 function shadowGeom(m) { return { off: Math.min(m * 0.12, 10), sig: Math.min(m * 0.2, 16), grow: Math.min(m * 0.04, 4) }; }
@@ -203,8 +211,10 @@ uniform int uOtherN;
 uniform vec4 uFuse[8];       // same-layer neighbours fused with this glass: centre offset.xy, half size.zw (local css px)
 uniform float uFuseR[8];
 uniform float uFuseTop[8];   // 1 when that neighbour is painted above this glass
+uniform vec4 uFuseTint[8];   // that neighbour's CSS background colour (straight alpha)
 uniform int uFuseN;
-uniform float uBlend, uHasSnap, uPress;
+uniform vec4 uTintSelf;      // this glass's CSS background colour
+uniform float uBlend, uPress;
 out vec4 o;
 
 // other glass is not in the snapshot; treat it like a hole so the rim never shows what is underneath it
@@ -255,8 +265,9 @@ float rrSd(vec2 p, vec2 hf, float rad, out vec2 n) {
 }
 float boxSd(vec2 p, out vec2 n) { return rrSd(p, uHalf, uRad, n); }
 
-// smooth union with the fused neighbours (polynomial smin: shapes only start to melt within uBlend px)
-float unionSd(vec2 p, float sdSelf, inout vec2 n, inout float mE) {
+// smooth union with the fused neighbours (polynomial smin: shapes only start to melt within uBlend px).
+// Mirrored on the CPU by UnionField, which builds the shared backplate's refraction map
+float unionSd(vec2 p, float sdSelf, inout vec2 n, inout float mE, inout vec4 tint) {
   float sd = sdSelf;
   float k = max(uBlend, 1.0);
   for (int i = 0; i < 8; i++) {
@@ -267,6 +278,7 @@ float unionSd(vec2 p, float sdSelf, inout vec2 n, inout float mE) {
     sd = mix(sj, sd, h) - k * h * (1.0 - h);
     n = normalize(mix(nj, n, h) + vec2(1e-5));
     mE = mix(min(uFuse[i].z, uFuse[i].w), mE, h);
+    tint = mix(uFuseTint[i], tint, h);
   }
   return sd;
 }
@@ -284,32 +296,34 @@ void main() {
   vec2 outward;
   float sdSelf = boxSd(p, outward);
   float sd = sdSelf, mE = m;
-  bool opaque = false;
+  float bridge = 0.0;          // part of this pixel that no glass box (and so no element background) covers
+  vec4 tintE = uTintSelf;
   if (uFuseN > 0) {
     // who draws this pixel: own interior is ours; an overlap belongs to the glass painted lowest, so the
-    // backplate sits under the content of every glass in the stack; outside every box, the nearest glass
-    // draws the bridge
+    // highlights sit under the content of every glass in the stack; outside every box, the nearest glass
+    // draws the bridge. The page behind the merged shape comes from the shared backplate element
     bool belowOther = false, inOther = false, closer = false;
+    float uncovered = clamp(0.5 + sdSelf * uDpr, 0.0, 1.0);
     for (int i = 0; i < 8; i++) {
       if (i >= uFuseN) break;
       vec2 nj;
       float sj = rrSd(p - uFuse[i].xy, uFuse[i].zw, uFuseR[i], nj);
       if (sj < 0.0) { inOther = true; if (uFuseTop[i] < 0.5) belowOther = true; }
       if (sj < sdSelf) closer = true;
+      uncovered *= clamp(0.5 + sj * uDpr, 0.0, 1.0);
     }
     bool own = sdSelf < 0.0 ? !(inOther && belowOther) : (!inOther && !closer);
     if (!own) { o = vec4(0.0); return; }
-    sd = unionSd(p, sdSelf, outward, mE);
-    // shared backplate: while glass is fused, the whole merged shape is drawn as one opaque piece of
-    // glass from the snapshot, so material and lighting match everywhere and no inner edges remain
-    opaque = uHasSnap > 0.5;
+    sd = unionSd(p, sdSelf, outward, mE, tintE);
+    bridge = uncovered;
   }
 
   vec2 ps = p - vec2(0.21, 1.0) * uShadowGeom.x;
   vec2 sn;
   float mS = m;
+  vec4 tS = vec4(0.0);
   float sds = boxSd(ps, sn);
-  if (uFuseN > 0) sds = unionSd(ps, sds, sn, mS);
+  if (uFuseN > 0) sds = unionSd(ps, sds, sn, mS, tS);
   sds += uShadowGeom.z;
   float sig = uShadowGeom.y;
   float sh = uShadow * (1.0 + 0.7 * uPress) * (0.6 * (1.0 - smoothstep(-sig, sig * 1.2, sds)) + 0.4 * (1.0 - smoothstep(-sig, sig * 3.6, sds)));
@@ -333,12 +347,12 @@ void main() {
   vec2 d = Tr.xy / max(-Tr.z, 0.15) * depth;
 
   // the refracting rim comes from the snapshot; inside it the live page shows through (CSS backdrop-filter)
-  float rim = opaque ? 1.0 : 1.0 - smoothstep(0.55, 1.0, t);
-  if (uNative > 0.5 && !opaque) rim = 0.0;   // native engine: the browser refracts, we add light and shadow
+  float rim = 1.0 - smoothstep(0.55, 1.0, t);
+  if (uNative > 0.5) rim = 0.0;   // native engine: the browser refracts, we add light and shadow
   float holeRim = 0.0;
   vec3 col = vec3(0.0);
   if (rim > 0.001) {
-    float bm = opaque ? 1.0 : mix(0.35, 1.0, t);   // refraction stays crisp right at the edge
+    float bm = mix(0.35, 1.0, t);   // refraction stays crisp right at the edge
     vec4 sG = bg(p + d, bm);
     float known = sG.a;
     col = sG.rgb;
@@ -350,14 +364,10 @@ void main() {
     }
     float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
     col = clamp(mix(vec3(l), col, uSat), 0.0, 1.0) * (1.0 - uDim);
-    if (opaque) {
-      col = mix(vec3(0.55) * (1.0 - uDim), col, known);   // nothing known here: neutral glass
-    } else {
-      // where the snapshot knows nothing, drop the refraction and let the live page show through
-      float rk = rim * smoothstep(0.35, 0.95, known);
-      holeRim = rim - rk;
-      rim = rk;
-    }
+    // where the snapshot knows nothing, drop the refraction and let the live page show through
+    float rk = rim * smoothstep(0.35, 0.95, known);
+    holeRim = rim - rk;
+    rim = rk;
   }
 
   float ld = dot(outward, uLight);
@@ -392,6 +402,8 @@ void main() {
   }
   float hiT = 1.0 - (1.0 - hi) * (1.0 - kl);
   vec4 over = vec4(vec3(hiT), 1.0 - (1.0 - kd) * (1.0 - hiT));   // premultiplied, over the live page
+  // a bridge has no element under it to carry the CSS background colour, so it is painted here
+  over += vec4(tintE.rgb * tintE.a, tintE.a) * bridge * (1.0 - over.a);
   vec4 lens = mix(over, vec4(mix(col * (1.0 - kd), vec3(1.0), hiT), 1.0), rim);
   o = lens * aa + vec4(0.0, 0.0, 0.0, sh) * (1.0 - aa);
 }`;
@@ -399,7 +411,7 @@ void main() {
 const UNIFORMS = ['uSnap', 'uHaloTex', 'uSnapSize', 'uCenterSnap', 'uCanvasPx', 'uHalf', 'uLight', 'uTouch', 'uShadowGeom', 'uA',
   'uSnapScale', 'uDpr', 'uRad', 'uPad', 'uBezel', 'uK', 'uThick', 'uIor', 'uGap', 'uDisp', 'uFrost', 'uSpec',
   'uTint', 'uSat', 'uDim', 'uShadow', 'uTouchAmt', 'uHalo', 'uGlyphDark', 'uNative', 'uOther', 'uOtherR', 'uOtherN',
-  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseN', 'uBlend', 'uHasSnap', 'uPress'];
+  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseN', 'uTintSelf', 'uBlend', 'uPress'];
 
 class Renderer {
   constructor(canvas) {
@@ -472,6 +484,16 @@ class Renderer {
     gl.activeTexture(gl.TEXTURE0);
     return t;
   }
+  // every copy out of the shared canvas copies its whole drawing buffer, so it should not stay at the size of
+  // the largest glass ever drawn (an opened, then closed, big panel): shrink it after a second of drawing less
+  endFrame() {
+    if (!this.usedW) return;
+    const big = this.canvas.width * this.canvas.height > this.usedW * this.usedH * 1.5;
+    this.slack = big ? (this.slack || 0) + 1 : 0;
+    if (this.slack > 60) { this.canvas.width = this.usedW; this.canvas.height = this.usedH; this.slack = 0; }
+    this.usedW = 0; this.usedH = 0;
+  }
+
   draw(g, snap, native) {
     const gl = this.gl, U = this.U, P = g.p, G = g.geom, f = g.frame;
     const cw = g.canvas.width, ch = g.canvas.height;
@@ -479,6 +501,7 @@ class Renderer {
       this.canvas.width = Math.max(this.canvas.width, cw);
       this.canvas.height = Math.max(this.canvas.height, ch);
     }
+    this.usedW = Math.max(this.usedW || 0, cw); this.usedH = Math.max(this.usedH || 0, ch);
     gl.viewport(0, 0, cw, ch);
     gl.enable(gl.SCISSOR_TEST);
     gl.scissor(0, 0, cw, ch);
@@ -535,20 +558,24 @@ class Renderer {
     const fa = this.fuseBuf || (this.fuseBuf = new Float32Array(32));
     const fr = this.fuseRBuf || (this.fuseRBuf = new Float32Array(8));
     const ft = this.fuseTBuf || (this.fuseTBuf = new Float32Array(8));
-    const sA = Math.sqrt(Math.abs(f.A[0] * f.A[3] - f.A[1] * f.A[2])) || 1;
+    const fc = this.fuseCBuf || (this.fuseCBuf = new Float32Array(32));
+    const sA = g.frameScale();
     for (let i = 0; i < fuse.length; i++) {
       const o = fuse[i];
       fa[i * 4] = (o.frame.cx - f.cx) / sA; fa[i * 4 + 1] = (o.frame.cy - f.cy) / sA;
-      fa[i * 4 + 2] = o.rect.width / 2 / sA; fa[i * 4 + 3] = o.rect.height / 2 / sA;
-      fr[i] = Math.min(o.geom.r, fa[i * 4 + 2], fa[i * 4 + 3]);
+      const so = o.frameScale() / sA;   // the neighbour's layout box, in this glass's local px (as Plate.update sees it)
+      fa[i * 4 + 2] = o.geom.hw * so; fa[i * 4 + 3] = o.geom.hh * so;
+      fr[i] = Math.min(o.geom.r * so, fa[i * 4 + 2], fa[i * 4 + 3]);
       ft[i] = g.paintsBelow(o) ? 1 : 0;
+      fc.set(o.tint, i * 4);
     }
     gl.uniform4fv(U.uFuse, fa);
     gl.uniform1fv(U.uFuseR, fr);
     gl.uniform1fv(U.uFuseTop, ft);
+    gl.uniform4fv(U.uFuseTint, fc);
     gl.uniform1i(U.uFuseN, fuse.length);
-    gl.uniform1f(U.uBlend, Math.min(P.blend, G.pad * 1.6));
-    gl.uniform1f(U.uHasSnap, snap ? 1 : 0);
+    gl.uniform4fv(U.uTintSelf, g.tint);
+    gl.uniform1f(U.uBlend, g.blendK());
     gl.uniform1f(U.uPress, g.press || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     g.ctx.clearRect(0, 0, cw, ch);
@@ -823,6 +850,109 @@ class Capturer {
   }
 }
 
+// how much to darken, as a function of linear luminance (so white keeps 3:1)
+const NEED_TABLE = (() => {
+  const v = [];
+  for (let i = 0; i <= 32; i++) {
+    const L = i / 32;
+    v.push(L <= 0.3 ? '0' : (1 - Math.pow(0.3 / L, 1 / 2.2)).toFixed(4));
+  }
+  return v.join(' ');
+})();
+
+// ------------------------------------------------------------------ SVG filters (native engine)
+// edge refraction: the map's R/G channels hold the offset to sample from, three displacements give dispersion
+const FILTER_CORE = `
+  <feGaussianBlur class="blur" in="SourceGraphic" stdDeviation="1" result="blur"/>
+  <feImage class="map" x="0" y="0" preserveAspectRatio="none" result="map"/>
+  <feDisplacementMap class="dr" in="blur" in2="map" xChannelSelector="R" yChannelSelector="G" result="dr"/>
+  <feDisplacementMap class="dg" in="blur" in2="map" xChannelSelector="R" yChannelSelector="G" result="dg"/>
+  <feDisplacementMap class="db" in="blur" in2="map" xChannelSelector="R" yChannelSelector="G" result="db"/>
+  <feColorMatrix in="dr" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="r"/>
+  <feColorMatrix in="dg" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="g"/>
+  <feColorMatrix in="db" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="b"/>
+  <feComposite in="r" in2="g" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="rg"/>
+  <feComposite in="rg" in2="b" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="rgb"/>
+  <feColorMatrix class="sat" in="rgb" type="saturate" values="1.16" result="satd"/>
+  <feComponentTransfer in="satd" result="glass">
+    <feFuncR class="dim" type="linear" slope="1" intercept="0"/>
+    <feFuncG class="dim" type="linear" slope="1" intercept="0"/>
+    <feFuncB class="dim" type="linear" slope="1" intercept="0"/>
+  </feComponentTransfer>`;
+// one glass with contrast: 'halo': darken around the glyphs drawn by opts.mask, as much as the backdrop needs.
+// Only built into the filter while it is on (otherwise it would be eight full-size passes multiplying by 1)
+const FILTER_HALO = `
+  <feGaussianBlur in="glass" stdDeviation="5" result="gb"/>
+  <feComponentTransfer in="gb" result="glin">
+    <feFuncR type="gamma" amplitude="1" exponent="2.2" offset="0"/>
+    <feFuncG type="gamma" amplitude="1" exponent="2.2" offset="0"/>
+    <feFuncB type="gamma" amplitude="1" exponent="2.2" offset="0"/>
+  </feComponentTransfer>
+  <feColorMatrix in="glin" type="matrix" values="0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0 0 0 1 0" result="lum"/>
+  <feComponentTransfer in="lum" result="need">
+    <feFuncR type="table" tableValues="${NEED_TABLE}"/>
+    <feFuncG type="table" tableValues="${NEED_TABLE}"/>
+    <feFuncB type="table" tableValues="${NEED_TABLE}"/>
+  </feComponentTransfer>
+  <feImage class="halo" x="0" y="0" preserveAspectRatio="none" result="halo"/>
+  <feComposite in="need" in2="halo" operator="arithmetic" k1="1" k2="0" k3="0" k4="0" result="dh"/>
+  <feComponentTransfer in="dh" result="fac">
+    <feFuncR class="fac" type="linear" slope="0" intercept="1"/>
+    <feFuncG class="fac" type="linear" slope="0" intercept="1"/>
+    <feFuncB class="fac" type="linear" slope="0" intercept="1"/>
+    <feFuncA type="linear" slope="0" intercept="1"/>
+  </feComponentTransfer>
+  <feComposite in="glass" in2="fac" operator="arithmetic" k1="1" k2="0" k3="0" k4="0"/>`;
+// shared backplate of fused glass: the map's B channel is the merged outline, everything outside it is cut away
+const FILTER_MASK = `
+  <feColorMatrix in="map" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 1 0 0" result="cov"/>
+  <feComposite in="glass" in2="cov" operator="in"/>`;
+
+function makeFilter(M, id, tail) {
+  const f = document.createElementNS(SVGNS, 'filter');
+  f.setAttribute('id', id);
+  f.setAttribute('filterUnits', 'userSpaceOnUse');
+  f.setAttribute('primitiveUnits', 'userSpaceOnUse');
+  f.setAttribute('color-interpolation-filters', 'sRGB');
+  f.setAttribute('x', '0'); f.setAttribute('y', '0');
+  f.innerHTML = FILTER_CORE + tail;
+  M.defs().appendChild(f);
+  return f;
+}
+function setFilterState(f, w, h, url, scale, P) {
+  const q = (sel) => f.querySelector(sel);
+  for (const el of [f, q('.map')]) { el.setAttribute('width', w); el.setAttribute('height', h); }
+  q('.map').setAttribute('href', url);
+  q('.dr').setAttribute('scale', (scale * (1 - P.disp)).toFixed(3));
+  q('.dg').setAttribute('scale', scale.toFixed(3));
+  q('.db').setAttribute('scale', (scale * (1 + P.disp)).toFixed(3));
+  q('.blur').setAttribute('stdDeviation', P.frost.toFixed(2));
+  q('.sat').setAttribute('values', String(P.sat));
+  f.querySelectorAll('.dim').forEach((n) => n.setAttribute('slope', (1 - P.dim).toFixed(3)));
+}
+
+// CSS colour -> [r, g, b, a] in 0..1 (anything the canvas understands; unknown -> transparent)
+const colorCache = new Map();
+let colorCtx = null;
+const RGBA_RE = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/;
+function parseColor(str) {
+  let c = colorCache.get(str);
+  if (c) return c;
+  let m = RGBA_RE.exec(str || '');
+  if (!m && str) {
+    colorCtx = colorCtx || document.createElement('canvas').getContext('2d');
+    colorCtx.fillStyle = '#010203';
+    colorCtx.fillStyle = str;
+    const v = colorCtx.fillStyle;
+    if (v[0] === '#' && (v !== '#010203' || /^#010203$/i.test(str))) m = [0, parseInt(v.slice(1, 3), 16), parseInt(v.slice(3, 5), 16), parseInt(v.slice(5, 7), 16)];
+    else m = RGBA_RE.exec(v);
+  }
+  c = m ? [m[1] / 255, m[2] / 255, m[3] / 255, m[4] == null ? 1 : /%$/.test(m[4]) ? parseFloat(m[4]) / 100 : +m[4]] : [0, 0, 0, 0];
+  if (colorCache.size > 256) colorCache.clear();
+  colorCache.set(str, c);
+  return c;
+}
+
 // ------------------------------------------------------------------ one glass element
 let uid = 0;
 class Glass {
@@ -837,8 +967,12 @@ class Glass {
     this.frame = { cx: 0, cy: 0, A: [1, 0, 0, 1] };
     this.others = [];
     this.fuse = [];
+    this.plate = null;         // shared backplate while fused with other glass
     this.press = 0;
     this.layer = '';
+    this.scaleProp = 1;
+    this.bgColor = '';
+    this.tint = new Float32Array(4);   // CSS background colour, painted on the bridges while fused
     this.geom = null;
     this.key = '';
     this.dirty = true;
@@ -903,8 +1037,10 @@ class Glass {
   bindPointer() {
     const on = !!(this.p.pointer || this.p.button);
     if (on && !this.ptr) {
-      const st = this.ptr = { over: false, down: false, x: 0, y: 0 };
-      const pos = (e) => { const r = this.el.getBoundingClientRect(); st.x = e.clientX - (r.left + r.width / 2); st.y = e.clientY - (r.top + r.height / 2); };
+      // the pointer is kept in page coordinates and placed on the glass where the glass is drawn this frame
+      // (stepPointer), so the light stays under the finger while the glass is dragged
+      const st = this.ptr = { over: false, down: false, cx: 0, cy: 0 };
+      const pos = (e) => { st.cx = e.clientX; st.cy = e.clientY; };
       st.h = {
         pointerenter: (e) => { st.over = true; pos(e); },
         pointermove: pos,
@@ -926,7 +1062,7 @@ class Glass {
     const target = st.down ? 1 : st.over ? 0.45 : 0;
     let a = this.touch.amt + (target - this.touch.amt) * (1 - Math.exp(-dt * (target > this.touch.amt ? 14 : 5)));
     if (Math.abs(a - target) < 0.003) a = target;
-    this.setLight(a, st.x, st.y);
+    this.setLight(a, st.cx - this.frame.cx, st.cy - this.frame.cy);
     if (this.p.button) {
       const pt = st.down && !(this.drag && this.drag.moved) ? 1 : 0;
       let pr = this.press + (pt - this.press) * (1 - Math.exp(-dt * 18));
@@ -980,7 +1116,18 @@ class Glass {
   }
 
   // glass only melts into glass of the same material, otherwise the joint would show a seam
-  material() { const P = this.p; return [P.frost, P.sat, P.tint, P.dim].join(','); }
+  // (disp too: the merged shape is refracted by one filter with one dispersion)
+  material() { const P = this.p; return [P.frost, P.sat, P.tint, P.dim, P.disp].join(','); }
+
+  fusesWith(o) {
+    return this.p.merge && o.p.merge && o.layer === this.layer && this.material() === o.material() &&
+      this.gapTo(o) < Math.min(this.p.blend, o.p.blend);
+  }
+
+  // css px of the page per local css px of this element (transform and the scale property)
+  frameScale() { const A = this.frame.A; return (Math.sqrt(Math.abs(A[0] * A[3] - A[1] * A[2])) || 1) * this.scaleProp; }
+  // how far the smooth union reaches, local css px (the bridges must fit on the canvas around the element)
+  blendK() { return Math.max(1, Math.min(this.p.blend, this.geom.pad * 1.6)); }
 
   // true when this glass is painted before (under) the other one; same z-index => document order
   paintsBelow(o) {
@@ -1068,20 +1215,19 @@ class Glass {
     this.key = '';
     this.dirty = true;
     const eng = this.M.engine;
+    this.backdropOn = !this.plate;   // while fused, the shared backplate is the backdrop
     if (eng === 'native') this.buildNative();
     else {
       this.removeFilter();
-      const bf = this.cssBackdrop();
-      this.el.style.backdropFilter = bf;
-      this.el.style.webkitBackdropFilter = bf;
-      this.backdropOn = true;
+      this.applyBackdrop();
       this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
       if (eng === 'css' || !this.M.renderer) this.paintOverlayCPU();
     }
   }
 
   removeFilter() {
-    if (this.filter) { this.filter.remove(); this.filter = null; }
+    if (this.filters) { for (const f of this.filters) f.remove(); this.filters = null; }
+    this.nativeMap = null;
   }
 
   buildNative() {
@@ -1091,7 +1237,7 @@ class Glass {
     const nw = Math.max(8, Math.round(G.w * sc)), nh = Math.max(8, Math.round(G.h * sc));
     const mc = document.createElement('canvas');
     mc.width = nw; mc.height = nh;
-    const mctx = mc.getContext('2d');
+    const mctx = mc.getContext('2d', { willReadFrequently: true });
     const map = mctx.createImageData(nw, nh);
     const dx = new Float32Array(nw * nh), dy = new Float32Array(nw * nh);
     let maxD = 0.5;
@@ -1102,8 +1248,9 @@ class Glass {
       for (let i = 0; i < nw; i++) {
         const lx = (i + 0.5) / sc - G.hw;
         if (Math.abs(lx) < G.hw - band - G.r && Math.abs(ly) < G.hh - band - G.r) continue;
-        const o = lensOptics(lx, ly, G, P);
-        if (o.sd > 0.5) continue;
+        const s = boxSd(lx, ly, G.hw, G.hh, G.r);
+        if (s.sd > 0.5) continue;
+        const o = opticsAt(s.sd, s.nx, s.ny, G.m, P, false);
         const k = j * nw + i;
         dx[k] = o.dx; dy[k] = o.dy;
         maxD = Math.max(maxD, Math.abs(o.dx), Math.abs(o.dy));
@@ -1120,7 +1267,8 @@ class Glass {
     // highlights and shadow: WebGL when available (see update), otherwise once on the CPU
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     if (!this.M.renderer) this.paintOverlayCPU();
-    this.buildNativeFilter(mc, scale);
+    this.nativeMap = { url: mc.toDataURL(), scale };
+    this.commitNative();
   }
 
   paintOverlayCPU() {
@@ -1150,86 +1298,28 @@ class Glass {
     this.ctx.putImageData(img, 0, 0);
   }
 
-  buildNativeFilter(mc, scale) {
+  // The SVG filter exists twice. A change is written into the copy that is not on screen and backdrop-filter
+  // is then pointed at it, so Chrome rebuilds the filter at once and the element never shows a frame
+  // without (or with a half-updated) backdrop.
+  commitNative() {
+    if (!this.nativeMap || !this.geom) return;
     const G = this.geom, P = this.p;
-    if (!this.filter) {
-      const f = document.createElementNS(SVGNS, 'filter');
-      f.setAttribute('id', this.id);
-      f.setAttribute('filterUnits', 'userSpaceOnUse');
-      f.setAttribute('primitiveUnits', 'userSpaceOnUse');
-      f.setAttribute('color-interpolation-filters', 'sRGB');
-      f.innerHTML = `
-        <feGaussianBlur class="blur" in="SourceGraphic" stdDeviation="1" result="blur"/>
-        <feImage class="map" x="0" y="0" preserveAspectRatio="none" result="map"/>
-        <feDisplacementMap class="dr" in="blur" in2="map" xChannelSelector="R" yChannelSelector="G" result="dr"/>
-        <feDisplacementMap class="dg" in="blur" in2="map" xChannelSelector="R" yChannelSelector="G" result="dg"/>
-        <feDisplacementMap class="db" in="blur" in2="map" xChannelSelector="R" yChannelSelector="G" result="db"/>
-        <feColorMatrix in="dr" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="r"/>
-        <feColorMatrix in="dg" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="g"/>
-        <feColorMatrix in="db" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="b"/>
-        <feComposite in="r" in2="g" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="rg"/>
-        <feComposite in="rg" in2="b" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="rgb"/>
-        <feColorMatrix class="sat" in="rgb" type="saturate" values="1.16" result="satd"/>
-        <feComponentTransfer in="satd" result="glass">
-          <feFuncR class="dim" type="linear" slope="1" intercept="0"/>
-          <feFuncG class="dim" type="linear" slope="1" intercept="0"/>
-          <feFuncB class="dim" type="linear" slope="1" intercept="0"/>
-        </feComponentTransfer>
-        <feGaussianBlur in="glass" stdDeviation="5" result="gb"/>
-        <feComponentTransfer in="gb" result="glin">
-          <feFuncR type="gamma" amplitude="1" exponent="2.2" offset="0"/>
-          <feFuncG type="gamma" amplitude="1" exponent="2.2" offset="0"/>
-          <feFuncB type="gamma" amplitude="1" exponent="2.2" offset="0"/>
-        </feComponentTransfer>
-        <feColorMatrix in="glin" type="matrix" values="0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0 0 0 1 0" result="lum"/>
-        <feComponentTransfer in="lum" result="need">
-          <feFuncR type="table" tableValues="${NEED_TABLE}"/>
-          <feFuncG type="table" tableValues="${NEED_TABLE}"/>
-          <feFuncB type="table" tableValues="${NEED_TABLE}"/>
-        </feComponentTransfer>
-        <feImage class="halo" x="0" y="0" preserveAspectRatio="none" result="halo"/>
-        <feComposite in="need" in2="halo" operator="arithmetic" k1="1" k2="0" k3="0" k4="0" result="dh"/>
-        <feComponentTransfer in="dh" result="fac">
-          <feFuncR class="fac" type="linear" slope="0" intercept="1"/>
-          <feFuncG class="fac" type="linear" slope="0" intercept="1"/>
-          <feFuncB class="fac" type="linear" slope="0" intercept="1"/>
-          <feFuncA type="linear" slope="0" intercept="1"/>
-        </feComponentTransfer>
-        <feComposite in="glass" in2="fac" operator="arithmetic" k1="1" k2="0" k3="0" k4="0"/>`;
-      this.M.defs().appendChild(f);
-      this.filter = f;
+    if (!this.filters) { this.filters = [makeFilter(this.M, this.id + 'a', ''), makeFilter(this.M, this.id + 'b', '')]; this.fi = 0; }
+    const f = this.filters[this.fi ^ 1];
+    const on = !!(P.contrast === 'halo' && this.haloCanvas && P.glyphDark < 0.5);
+    if ((f.getAttribute('data-halo') === '1') !== on) { f.innerHTML = FILTER_CORE + (on ? FILTER_HALO : ''); f.setAttribute('data-halo', on ? '1' : '0'); }
+    setFilterState(f, G.w, G.h, this.nativeMap.url, this.nativeMap.scale, P);
+    if (on) {
+      const halo = f.querySelector('.halo');
+      halo.setAttribute('width', G.w); halo.setAttribute('height', G.h);
+      if (halo.getAttribute('href') !== this.haloUrl) halo.setAttribute('href', this.haloUrl);
+      f.querySelectorAll('.fac').forEach((n) => n.setAttribute('slope', '-1'));
     }
-    const f = this.filter;
-    const q = (sel) => f.querySelector(sel);
-    for (const el of [f, q('.map'), q('.halo')]) { el.setAttribute('width', G.w); el.setAttribute('height', G.h); }
-    f.setAttribute('x', '0'); f.setAttribute('y', '0');
-    q('.map').setAttribute('href', mc.toDataURL());
-    q('.dr').setAttribute('scale', (scale * (1 - P.disp)).toFixed(3));
-    q('.dg').setAttribute('scale', scale.toFixed(3));
-    q('.db').setAttribute('scale', (scale * (1 + P.disp)).toFixed(3));
-    q('.blur').setAttribute('stdDeviation', P.frost.toFixed(2));
-    q('.sat').setAttribute('values', String(P.sat));
-    f.querySelectorAll('.dim').forEach((n) => n.setAttribute('slope', (1 - P.dim).toFixed(3)));
-    this.applyNativeHalo();
-    const bf = `url(#${this.id})`;
-    this.el.style.backdropFilter = 'none';
-    this.el.style.webkitBackdropFilter = 'none';
-    // re-apply on the next frame so Chrome re-reads the updated filter
-    this.backdropOn = true;
-    requestAnimationFrame(() => {
-      if (this.M.engine !== 'native' || !this.filter || !this.backdropOn) return;
-      this.el.style.backdropFilter = bf;
-      this.el.style.webkitBackdropFilter = bf;
-    });
+    this.fi ^= 1;
+    this.applyBackdrop();
   }
 
-  applyNativeHalo() {
-    if (!this.filter) return;
-    const on = this.p.contrast === 'halo' && this.haloCanvas && this.p.glyphDark < 0.5;
-    const halo = this.filter.querySelector('.halo');
-    if (this.haloUrl && halo.getAttribute('href') !== this.haloUrl) halo.setAttribute('href', this.haloUrl);
-    this.filter.querySelectorAll('.fac').forEach((n) => n.setAttribute('slope', on ? '-1' : '0'));
-  }
+  applyNativeHalo() { if (this.filters) this.commitNative(); }
 
   // pass 1 of every frame: where is the glass, what layer is it on
   measureFrame() {
@@ -1244,6 +1334,9 @@ class Glass {
       A = [mm.a, mm.b, mm.c, mm.d];
     }
     this.frame.cx = cx; this.frame.cy = cy; this.frame.A = A;
+    const sp = cs.scale && cs.scale !== 'none' ? cs.scale.split(/\s+/).map(parseFloat) : null;
+    this.scaleProp = sp ? Math.sqrt(Math.abs((sp[0] || 1) * (sp.length > 1 ? sp[1] : sp[0] || 1))) || 1 : 1;
+    if (cs.backgroundColor !== this.bgColor) { this.bgColor = cs.backgroundColor; this.tint.set(parseColor(this.bgColor)); }
     this.rect = r;
     this.layer = (cs.position === 'fixed' ? 'f' : 'n') + '|' + cs.zIndex;
     if (this.p.adaptive) this.luminance = this.M.luminanceAt(cx, cy, this.geom.hw * 0.8, this.geom.hh * 0.8);
@@ -1265,29 +1358,31 @@ class Glass {
     if (!this.geom || !this.visible) return false;
     const eng = this.M.engine, R = this.M.renderer;
     if (eng === 'css' || !R) return false;            // static CPU overlay
-    const hasSnap = !!(snap && snap.uploaded);
-    if (eng === 'snapshot' && !hasSnap) return false;
-    const useSnap = hasSnap && (eng === 'snapshot' || this.fuse.length > 0);
+    // only the snapshot engine samples the page; fused glass in the native engine is refracted live by the
+    // shared backplate, the canvas adds light, shadow and the bridges' background colour
+    const useSnap = eng === 'snapshot' && !!(snap && snap.uploaded);
+    if (eng === 'snapshot' && !useSnap) return false;
     const f = this.frame;
-    const rk = (o) => [o.rect.left, o.rect.top, o.rect.width, o.rect.height].map((v) => v.toFixed(1)).join(',');
-    const key = [eng, this.press.toFixed(3),
-      useSnap ? [f.cx.toFixed(2), f.cy.toFixed(2), global.scrollX, global.scrollY, snap.version, this.M.liveVersion].join(',') : '',
+    const rk = (o) => [o.rect.left, o.rect.top, o.rect.width, o.rect.height].map((v) => v.toFixed(1)).join(',') + o.bgColor;
+    const key = [eng, this.press.toFixed(3), this.bgColor,
+      useSnap ? [f.cx.toFixed(2), f.cy.toFixed(2), global.scrollX, global.scrollY, snap.version].join(',') : '',
       useSnap ? f.A.map((v) => v.toFixed(4)).join(',') : '',
-      this.fuse.map(rk).join(';'), useSnap ? this.others.map(rk).join(';') : ''].join('|');
+      this.fuse.length ? rk(this) + ':' + this.fuse.map(rk).join(';') : '', useSnap ? this.others.map(rk).join(';') : ''].join('|');
     if (!this.dirty && key === this.key) return false;
     this.key = key;
     this.dirty = false;
-    // while fused, the canvas paints the whole merged shape; the element's own backdrop would filter the
-    // content of the glass underneath a second time
-    this.setBackdrop(!(useSnap && this.fuse.length));
     R.draw(this, useSnap ? snap : null, eng === 'native');
     return true;
   }
 
+  // the element's own backdrop is switched off while a shared backplate shows the page under the merged shape
   setBackdrop(on) {
     if (this.backdropOn === on) return;
     this.backdropOn = on;
-    const bf = !on ? 'none' : this.M.engine === 'native' && this.filter ? `url(#${this.id})` : this.cssBackdrop();
+    this.applyBackdrop();
+  }
+  applyBackdrop() {
+    const bf = !this.backdropOn ? 'none' : this.M.engine === 'native' && this.filters ? `url(#${this.filters[this.fi].id})` : this.cssBackdrop();
     this.el.style.backdropFilter = bf;
     this.el.style.webkitBackdropFilter = bf;
   }
@@ -1338,15 +1433,285 @@ function boxBlurV(src, dst, w, h, r) {
   }
 }
 
-// how much to darken, as a function of linear luminance (so white keeps 3:1)
-const NEED_TABLE = (() => {
-  const v = [];
-  for (let i = 0; i <= 32; i++) {
-    const L = i / 32;
-    v.push(L <= 0.3 ? '0' : (1 - Math.pow(0.3 / L, 1 / 2.2)).toFixed(4));
+// ------------------------------------------------------------------ shared backplate of fused glass
+// While glass is fused, one extra element painted right under the group shows the page through the whole
+// merged shape, and the glass elements switch their own backdrop off (otherwise the upper glass would filter
+// the lower one a second time and every box would keep its own inner edge).
+//   native    SVG backdrop filter whose refraction map is built from the merged outline
+//   snapshot  the glass's CSS backdrop filter, clipped to the merged outline (the canvases draw the rim)
+// Either way it is the live page that gets filtered: nothing behind the glass changes when it fuses, and
+// fusing never needs a page snapshot. The glass canvases still draw highlights, shadow and bridge colour.
+
+// The merged outline as a field over the plate, in plate px. at() computes it the way the glass that draws
+// that pixel does in the shader (ownership test, then unionSd() over that glass's own neighbours), so the
+// backplate and the highlights line up exactly. Members are given in paint order.
+class UnionField {
+  constructor(D) {
+    const N = this.N = D.length, F = () => new Float64Array(N);
+    this.cx = F(); this.cy = F(); this.ax = F(); this.ay = F(); this.r = F(); this.m = F(); this.k = F();
+    this.sd = F(); this.nx = F(); this.ny = F();
+    this.P = D.map((d) => d.P);
+    this.nb = D.map((d) => Int32Array.from(d.nb.map((e) => D.indexOf(e))));
+    D.forEach((d, i) => {
+      this.cx[i] = d.cx; this.cy[i] = d.cy; this.ax[i] = d.hw - d.r; this.ay[i] = d.hh - d.r;
+      this.r[i] = d.r; this.m[i] = d.m; this.k[i] = d.k;
+    });
+    this.kMax = Math.max(...this.k);
+    this.usd = 0; this.unx = 0; this.uny = 0; this.um = 0; this.uo = 0;
   }
-  return v.join(' ');
-})();
+  // signed distance and outward normal of every member's rounded box (rrSd() in the shader); returns the min
+  boxes(x, y) {
+    let best = Infinity;
+    for (let i = 0; i < this.N; i++) {
+      const lx = x - this.cx[i], ly = y - this.cy[i];
+      const qx = (lx < 0 ? -lx : lx) - this.ax[i], qy = (ly < 0 ? -ly : ly) - this.ay[i];
+      let s, nx = 0, ny = 1;
+      if (qx > 0 && qy > 0) { const lo = Math.sqrt(qx * qx + qy * qy); s = lo - this.r[i]; nx = qx / lo; ny = qy / lo; }
+      else if (qx > qy) { s = qx - this.r[i]; nx = 1; ny = 0; }
+      else s = qy - this.r[i];
+      this.sd[i] = s; this.nx[i] = lx < 0 ? -nx : nx; this.ny[i] = ly < 0 ? -ny : ny;
+      if (s < best) best = s;
+    }
+    return best;
+  }
+  at(x, y) {
+    this.boxes(x, y);
+    let inside = -1, near = 0;
+    for (let i = 0; i < this.N; i++) {
+      if (this.sd[i] < 0 && inside < 0) inside = i;   // an overlap belongs to the lowest glass
+      if (this.sd[i] < this.sd[near]) near = i;
+    }
+    const o = inside >= 0 ? inside : near, k = this.k[o], nb = this.nb[o];
+    let sd = this.sd[o], nx = this.nx[o], ny = this.ny[o], m = this.m[o];
+    for (let q = 0; q < nb.length; q++) {
+      const j = nb[q], sj = this.sd[j];
+      let h = 0.5 + 0.5 * (sj - sd) / k;
+      h = h < 0 ? 0 : h > 1 ? 1 : h;
+      sd = sj + (sd - sj) * h - k * h * (1 - h);
+      const ux = this.nx[j] + (nx - this.nx[j]) * h + 1e-5, uy = this.ny[j] + (ny - this.ny[j]) * h + 1e-5;
+      const il = 1 / Math.sqrt(ux * ux + uy * uy);
+      nx = ux * il; ny = uy * il;
+      m = this.m[j] + (m - this.m[j]) * h;
+    }
+    this.usd = sd; this.unx = nx; this.uny = ny; this.um = m; this.uo = o;
+    return sd;
+  }
+  // over a disc of radius rad around (x, y): 1 = certainly outside by more than out, -1 = certainly deeper
+  // than inn inside, 0 = look at every pixel. The union only differs from the closest box where two boxes are
+  // within k of each other, so blocks away from the joints are decided from the boxes alone
+  classify(x, y, rad, out, inn) {
+    const mn = this.boxes(x, y), kMax = this.kMax;
+    let close = 0;
+    for (let i = 0; i < this.N; i++) if (this.sd[i] - rad < mn + rad + kMax) close++;
+    const drop = close > 1 ? kMax * 0.25 * (close - 1) : 0;
+    if (mn - rad - drop > out) return 1;
+    if (mn + rad < -inn) return -1;
+    return 0;
+  }
+}
+// outline of the region f < 0 (grid of nx * ny values, step gs px) as SVG path data, for fill-rule evenodd.
+// Marching squares; crossing points are keyed by grid edge: horizontal 2 * node, vertical 2 * node + 1
+function contourPath(f, nx, ny, gs) {
+  const link = new Map();
+  const add = (a, b) => {
+    let l = link.get(a); if (!l) link.set(a, l = []); l.push(b);
+    l = link.get(b); if (!l) link.set(b, l = []); l.push(a);
+  };
+  for (let j = 0; j < ny - 1; j++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const n = j * nx + i;
+      const a = f[n] < 0, b = f[n + 1] < 0, c = f[n + nx + 1] < 0, d = f[n + nx] < 0;   // tl tr br bl
+      if (a === b && b === c && c === d) continue;
+      const T = 2 * n, R = 2 * (n + 1) + 1, B = 2 * (n + nx), L = 2 * n + 1;
+      const cut = [];
+      if (a !== b) cut.push(T);
+      if (b !== c) cut.push(R);
+      if (c !== d) cut.push(B);
+      if (d !== a) cut.push(L);
+      if (cut.length === 2) { add(cut[0], cut[1]); continue; }
+      // saddle: the centre decides whether the two inside corners connect
+      const mid = (f[n] + f[n + 1] + f[n + nx + 1] + f[n + nx]) / 4 < 0;
+      if (mid === a) { add(T, R); add(B, L); } else { add(T, L); add(R, B); }
+    }
+  }
+  const at = (key) => {
+    const n = key >> 1, i = n % nx, j = (n - i) / nx;
+    if (key & 1) { const t = f[n] / (f[n] - f[n + nx]); return ((i * gs).toFixed(2) + ' ' + ((j + t) * gs).toFixed(2)); }
+    const t = f[n] / (f[n] - f[n + 1]); return (((i + t) * gs).toFixed(2) + ' ' + (j * gs).toFixed(2));
+  };
+  const seen = new Set();
+  let out = '';
+  for (const start of link.keys()) {
+    if (seen.has(start)) continue;
+    let prev = -1, cur = start, first = true;
+    while (cur !== undefined && !seen.has(cur)) {
+      seen.add(cur);
+      out += (first ? 'M' : 'L') + at(cur);
+      first = false;
+      const l = link.get(cur);
+      const next = l[0] !== prev ? l[0] : l[1];
+      prev = cur; cur = next;
+    }
+    out += 'Z';
+  }
+  return out || 'M0 0Z';
+}
+
+let plateUid = 0;
+class Plate {
+  constructor(M, anchor) {
+    this.M = M;
+    this.anchor = anchor;
+    this.id = 'lgp' + (++plateUid);
+    this.el = document.createElement('div');
+    this.el.setAttribute('data-lg-ignore', '');
+    this.el.setAttribute('aria-hidden', 'true');
+    this.filters = null; this.fi = 0;
+    this.place();
+  }
+
+  // same layer as the glass, right before (so under) the lowest glass of the group
+  place() {
+    const a = this.anchor.el, cs = getComputedStyle(a);
+    this.layer = this.anchor.layer;
+    this.el.style.cssText = 'all:initial;display:block;margin:0;padding:0;border:0;box-sizing:border-box;pointer-events:none;' +
+      `position:${cs.position === 'fixed' ? 'fixed' : 'absolute'};z-index:${cs.zIndex};left:0;top:0;width:0;height:0;`;
+    a.parentNode.insertBefore(this.el, a);
+    this.tx = 0; this.ty = 0; this.w = -1; this.h = -1; this.key = ''; this.bf = '';
+    this.measure();
+  }
+  inPlace() { return this.el.nextSibling === this.anchor.el && this.layer === this.anchor.layer; }
+
+  // pass 1: where the plate's own origin is (it is positioned with a transform from there)
+  measure() {
+    const r = this.el.getBoundingClientRect();
+    this.ox = r.left - this.tx; this.oy = r.top - this.ty;
+  }
+
+  update(members) {
+    const native = this.M.engine === 'native';
+    // members in page px; the plate covers their bounding box plus room for what the smooth union adds
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    const D = members.map((g) => {
+      const s = g.frameScale(), G = g.geom, hw = G.hw * s, hh = G.hh * s, cx = g.frame.cx, cy = g.frame.cy;
+      x0 = Math.min(x0, cx - hw); y0 = Math.min(y0, cy - hh); x1 = Math.max(x1, cx + hw); y1 = Math.max(y1, cy + hh);
+      return { g, cx, cy, hw, hh, r: Math.min(G.r * s, hw, hh), m: Math.min(hw, hh), k: g.blendK() * s, P: g.p, sd: 0, nx: 0, ny: 0, nb: null };
+    });
+    let grow = 0;
+    for (const d of D) {
+      d.nb = d.g.fuse.map((o) => D.find((e) => e.g === o)).filter(Boolean);
+      grow = Math.max(grow, d.k * 0.25 * Math.max(1, d.nb.length));
+    }
+    grow = Math.ceil(grow + 2);
+    x0 -= grow; y0 -= grow;
+    const W = Math.ceil(x1 + grow - x0), H = Math.ceil(y1 + grow - y0);
+    for (const d of D) { d.cx -= x0; d.cy -= y0; }
+
+    // follows the glass every frame; the outline is only rebuilt when the glass moved relative to each other
+    const tx = Math.round((x0 - this.ox) * 100) / 100, ty = Math.round((y0 - this.oy) * 100) / 100;
+    if (tx !== this.tx || ty !== this.ty) { this.tx = tx; this.ty = ty; this.el.style.transform = `translate(${tx}px, ${ty}px)`; }
+    if (W !== this.w || H !== this.h) { this.w = W; this.h = H; this.el.style.width = W + 'px'; this.el.style.height = H + 'px'; }
+    const key = [native ? 'n' : 's', this.M.dpr, W, H].concat(D.map((d) =>
+      [d.cx, d.cy, d.hw, d.hh, d.r, d.k].map((v) => v.toFixed(2)).join(',') + '/' + d.nb.map((e) => D.indexOf(e)).join('.') +
+      '/' + OPTICAL.map((n) => d.P[n]).join(','))).join('|');
+    if (key !== this.key) {
+      this.key = key;
+      const t0 = performance.now();
+      if (native) this.buildMap(D, W, H); else this.buildClip(D, W, H);
+      const st = this.M.stats;
+      st.plateBuilds++;
+      st.plateMs = st.plateMs ? st.plateMs * 0.8 + (performance.now() - t0) * 0.2 : performance.now() - t0;
+    }
+    const bf = native ? (this.filters ? `url(#${this.filters[this.fi].id})` : 'none') : members[0].cssBackdrop();
+    if (bf !== this.bf) { this.bf = bf; this.el.style.backdropFilter = bf; this.el.style.webkitBackdropFilter = bf; }
+  }
+
+  // native: refraction map of the merged outline (R/G offset, B coverage), written into the filter copy that
+  // is not on screen and swapped in by update()
+  buildMap(D, W, H) {
+    const M = this.M;
+    // one map px per css px: the offsets are smooth and get filtered when scaled, a denser map looks the same
+    // (measured at dpr 2: max difference 25/255 on 0.03 % of the pixels) and costs four times as much
+    const sc = Math.min(1, 1400 / Math.max(W, H), Math.sqrt(1e6 / (W * H)));
+    const nw = Math.max(8, Math.round(W * sc)), nh = Math.max(8, Math.round(H * sc));
+    const sx = W / nw, sy = H / nh, px = (sx + sy) / 2;
+    const c = this.mapCanvas || (this.mapCanvas = document.createElement('canvas'));
+    if (c.width !== nw) c.width = nw;
+    if (c.height !== nh) c.height = nh;
+    // a CPU canvas: the map only goes through putImageData and toDataURL, a GPU one would upload and read back
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    const img = ctx.createImageData(nw, nh), data = img.data;
+    const U = new UnionField(D);
+    let bez = 0, mMax = 0;
+    for (const d of D) { bez = Math.max(bez, d.P.bezel); mMax = Math.max(mMax, d.m); }
+    const inner = Math.max(bez * mMax, 0.5) + px;
+    // flat glass is offset 0 (128) with the coverage in B; offsets (css px) are kept for the bezel band only
+    const u32 = new Uint32Array(data.buffer), le = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+    const OUT = le ? 0xff008080 : 0x808000ff, IN = le ? 0xffff8080 : 0x8080ffff;
+    u32.fill(OUT);
+    const band = [], bdx = [], bdy = [];
+    let maxD = 0.5;
+    // 8x8 blocks that are clearly outside, or clearly inside the bezel, need no per-pixel work
+    for (let by = 0; by < nh; by += 8) {
+      const bh = Math.min(8, nh - by);
+      for (let bx = 0; bx < nw; bx += 8) {
+        const bw = Math.min(8, nw - bx);
+        const kind = U.classify((bx + bw / 2) * sx, (by + bh / 2) * sy, 0.5 * Math.hypot(bw * sx, bh * sy), px, inner);
+        if (kind === 1) continue;
+        for (let j = by; j < by + bh; j++) {
+          if (kind === -1) { u32.fill(IN, j * nw + bx, j * nw + bx + bw); continue; }
+          for (let i = bx; i < bx + bw; i++) {
+            const sd = U.at((i + 0.5) * sx, (j + 0.5) * sy);
+            const a = 0.5 - sd / px;
+            if (a <= 0) continue;
+            const k = j * nw + i;
+            data[k * 4 + 2] = a >= 1 ? 255 : Math.round(255 * a);
+            const P = U.P[U.uo];
+            if (-sd >= Math.max(P.bezel * U.um, 0.5)) continue;   // past the bezel the glass is flat
+            const o = opticsAt(sd, U.unx, U.uny, U.um, P, false);
+            band.push(k); bdx.push(o.dx); bdy.push(o.dy);
+            const ad = Math.max(Math.abs(o.dx), Math.abs(o.dy));
+            if (ad > maxD) maxD = ad;
+          }
+        }
+      }
+    }
+    const scale = maxD * 2.02;
+    for (let q = 0; q < band.length; q++) {
+      const o = band[q] * 4;
+      data[o] = Math.round(255 * clamp(0.5 + bdx[q] / scale, 0, 1));
+      data[o + 1] = Math.round(255 * clamp(0.5 + bdy[q] / scale, 0, 1));
+    }
+    ctx.putImageData(img, 0, 0);
+    if (!this.filters) { this.filters = [makeFilter(M, this.id + 'a', FILTER_MASK), makeFilter(M, this.id + 'b', FILTER_MASK)]; this.fi = 0; }
+    setFilterState(this.filters[this.fi ^ 1], W, H, c.toDataURL(), scale, D[0].P);
+    this.fi ^= 1;
+  }
+
+  // snapshot: clip the CSS backdrop to the merged outline (vector, so it updates in the same frame everywhere)
+  buildClip(D, W, H) {
+    let mMin = Infinity;
+    for (const d of D) mMin = Math.min(mMin, d.m);
+    const gs = clamp(mMin / 8, 0.75, 2);
+    const nx = Math.ceil(W / gs) + 1, ny = Math.ceil(H / gs) + 1;
+    const f = new Float32Array(nx * ny), U = new UnionField(D);
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        const v = U.at(i * gs, j * gs);
+        f[j * nx + i] = i === 0 || j === 0 || i === nx - 1 || j === ny - 1 ? Math.max(v, 1e-3) : v;
+      }
+    }
+    const clip = `path(evenodd, '${contourPath(f, nx, ny, gs)}')`;
+    this.el.style.clipPath = clip;
+    this.el.style.webkitClipPath = clip;
+  }
+
+  destroy() {
+    this.el.remove();
+    if (this.filters) for (const f of this.filters) f.remove();
+    this.filters = null;
+  }
+}
 
 // ------------------------------------------------------------------ manager (one per page)
 class Manager {
@@ -1357,8 +1722,9 @@ class Manager {
     this.started = false;
     this.stats = {
       engine: '', glasses: 0, captures: 0, lastCaptureMs: 0, captureOnlyMs: 0, uploadMs: 0, renderMs: 0,
-      snapW: 0, snapH: 0, scale: 0, live: 0, holes: 0, error: '', parts: null,
+      snapW: 0, snapH: 0, scale: 0, live: 0, holes: 0, error: '', parts: null, plates: 0, plateBuilds: 0, plateMs: 0,
     };
+    this.plates = new Map();   // lowest glass of a fused group -> its shared backplate
   }
 
   start() {
@@ -1369,7 +1735,7 @@ class Manager {
     try { this.renderer = new Renderer(); } catch (err) { this.glError = String(err.message || err); }
     if (this.renderer) this.watchContext(this.renderer.canvas);
     this.capturer = new Capturer(this);
-    this.snap = null; this.snapVersion = 0; this.liveVersion = 0;
+    this.snap = null; this.snapVersion = 0;
     this.lum = null;
     this.liveAt = new WeakMap();
     this.scratch = document.createElement('canvas');
@@ -1378,7 +1744,8 @@ class Manager {
     this.watch();
     this.tick = this.tick.bind(this);
     this.lastTick = performance.now();
-    requestAnimationFrame(this.tick);
+    this.hookRaf();
+    this.rafId = this.raf(this.tick);
   }
 
   // a lost WebGL context (GPU reset, too many contexts) is rebuilt and everything redrawn
@@ -1413,6 +1780,7 @@ class Manager {
   setEngine(e) {
     this.engine = this.resolve(e);
     this.stats.engine = this.engine;
+    this.dropPlates();
     for (const g of this.glasses) {
       if (this.engine !== 'native') g.removeFilter();
       g.el.style.backgroundImage = g.saved.backgroundImage;
@@ -1443,11 +1811,46 @@ class Manager {
   wantsCapture() {
     if (this.cfg.capturer === 'modern-screenshot' && !global.modernScreenshot) return false;
     if (!this.glasses.length) return false;
-    if (this.engine === 'snapshot' || this.fusing) return true;
+    if (this.engine === 'snapshot') return true;
     return this.glasses.some((g) => g.p.adaptive);
   }
-  // the page as a texture: always in the snapshot engine; in the native engine only while glass is fusing
-  needsTexture() { return !!this.renderer && (this.engine === 'snapshot' || this.fusing); }
+  // the page as a texture: only the snapshot engine samples it (fused glass is refracted by the live backplate)
+  needsTexture() { return !!this.renderer && this.engine === 'snapshot'; }
+
+  dropPlates() {
+    for (const pl of this.plates.values()) pl.destroy();
+    this.plates = new Map();
+    for (const g of this.glasses) g.plate = null;
+  }
+
+  // pass 2b: fused glass forms groups (connected through g.fuse); each group gets one backplate
+  updatePlates() {
+    const next = new Map(), seen = new Set();
+    for (const g of this.glasses) g.plate = null;
+    for (const g of this.glasses) {
+      if (!g.fuse.length || seen.has(g)) continue;
+      const members = [], stack = [g];
+      seen.add(g);
+      while (stack.length) {
+        const x = stack.pop();
+        members.push(x);
+        for (const o of x.fuse) if (!seen.has(o)) { seen.add(o); stack.push(o); }
+      }
+      members.sort((a, b) => (a.paintsBelow(b) ? -1 : 1));
+      const anchor = members[0];
+      let pl = this.plates.get(anchor);
+      if (pl && !pl.inPlace()) { pl.destroy(); pl = null; }
+      if (!pl) pl = new Plate(this, anchor);
+      next.set(anchor, pl);
+      for (const m of members) m.plate = pl;
+      pl.update(members);
+    }
+    for (const [a, pl] of this.plates) if (next.get(a) !== pl) pl.destroy();
+    this.plates = next;
+    this.fusing = next.size > 0;
+    this.stats.plates = next.size;
+    for (const g of this.glasses) if (g.geom) g.setBackdrop(!g.plate);   // unmeasured glass has no backdrop yet
+  }
 
   defs() {
     if (!this.svg) {
@@ -1548,7 +1951,8 @@ class Manager {
     for (const el of document.querySelectorAll('[data-lg-live]')) {
       const r = el.getBoundingClientRect();
       if (!r.width || !r.height) continue;
-      if (!this.glasses.some((g) => g.overlaps(r))) continue;
+      const over = this.glasses.filter((g) => g.visible && g.overlaps(r));
+      if (!over.length) continue;
       const last = this.liveAt.get(el) || 0;
       if (now - last < minDt) { n++; continue; }
       this.liveAt.set(el, now);
@@ -1565,47 +1969,75 @@ class Manager {
       try {
         ctx.drawImage(el, (cx0 - x0) / w * iw, (cy0 - y0) / h * ih, sc.width / w * iw, sc.height / h * ih, 0, 0, sc.width, sc.height);
         R.patch(cx0, cy0, sc);
+        for (const g of over) g.dirty = true;   // only glass over this layer has to redraw
         n++;
       } catch (err) { /* cross-origin media cannot be read */ }
     }
-    if (n) this.liveVersion++;
     return n;
   }
 
+  // The frame's work has to run after the page's own requestAnimationFrame callbacks, which may move glass:
+  // otherwise the backplate and the snapshot sampling trail such glass by a frame. requestAnimationFrame is
+  // wrapped so that whenever a page callback runs after the SDK in a frame, the SDK's frame is redone right
+  // there and its next callback is re-queued behind the page's, so from the next frame on it simply runs last.
+  // (A post-layout ResizeObserver hook would need a layout change every frame, which makes Chrome re-damage
+  // and re-composite most of the screen.)
+  hookRaf() {
+    const raf = global.requestAnimationFrame.bind(global), caf = global.cancelAnimationFrame.bind(global);
+    const M = this;
+    this.raf = raf;
+    this.caf = caf;
+    global.requestAnimationFrame = function requestAnimationFrame(cb) {
+      if (typeof cb !== 'function') return raf(cb);
+      return raf(function (t) {
+        try { return cb(t); } finally {
+          if (M.tickT === t && M.rafId) {
+            caf(M.rafId);
+            M.rafId = raf(M.tick);
+            try { M.frame(t); } catch (err) { console.warn('[LiquidGlass]', err); }
+          }
+        }
+      });
+    };
+  }
+
   tick(now) {
+    this.tickT = now;
+    this.rafId = this.raf(this.tick);
+    this.frame(now);
+  }
+
+  frame(now) {
     const dt = Math.min(0.05, Math.max(0, (now - this.lastTick) / 1000));
     this.lastTick = now;
     for (const g of this.glasses.slice()) if (!g.el.isConnected) g.destroy();
     const t0 = performance.now();
     // pass 1: positions and layers
-    for (const g of this.glasses) { g.stepPointer(dt); g.measureFrame(); }
-    // pass 2: who fuses with whom (same layer, closer than blend), who just overlaps (a hole)
-    let fusing = false;
+    for (const g of this.glasses) { g.measureFrame(); g.stepPointer(dt); }
+    for (const pl of this.plates.values()) pl.measure();
+    // pass 2: who fuses with whom (same layer, closer than blend), who just overlaps (a hole). Fusing needs
+    // the WebGL highlights; in the snapshot engine also the snapshot the rim is refracted from
+    const canFuse = !!this.renderer && !this.contextLost &&
+      (this.engine === 'native' || (this.engine === 'snapshot' && !!(this.snap && this.snap.uploaded)));
     for (const g of this.glasses) {
       g.fuse = []; g.others = [];
       if (!g.visible) continue;
       for (const o of this.glasses) {
         if (o === g || !o.visible) continue;
-        const gap = g.gapTo(o);
-        if (g.p.merge && o.p.merge && o.layer === g.layer && g.material() === o.material() && gap < Math.min(g.p.blend, o.p.blend)) {
-          if (g.fuse.length < 8) g.fuse.push(o);
-        } else if (g.overlaps(o.rect) && g.others.length < 8) g.others.push(o);
+        if (canFuse && g.fusesWith(o)) { if (g.fuse.length < 8) g.fuse.push(o); }
+        else if (g.overlaps(o.rect) && g.others.length < 8) g.others.push(o);
       }
-      if (g.fuse.length) fusing = true;
     }
-    if (fusing !== this.fusing) {
-      this.fusing = fusing;
-      if (fusing && this.engine === 'native' && !(this.snap && this.snap.uploaded && this.snap.scale >= this.cfg.captureScale * 0.9)) this.refresh();
-    }
+    this.updatePlates();
     const live = this.patchLive(now);
     // pass 3: draw what changed
     let drew = 0;
     if (!this.contextLost) for (const g of this.glasses) if (g.render(this.snap)) drew++;
+    if (drew) this.renderer.endFrame();
     const cost = performance.now() - t0;
     if (drew || live) this.stats.renderMs = this.stats.renderMs * 0.9 + cost * 0.1;
     this.stats.live = live;
     this.stats.glasses = this.glasses.length;
-    requestAnimationFrame(this.tick);
   }
 }
 
