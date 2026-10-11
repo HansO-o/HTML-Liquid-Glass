@@ -493,7 +493,8 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
     </div>
 
     <div class="grp">
-      <div class="lbl">圆形按钮</div>
+      <div class="lbl">玻璃参数</div>
+      <p class="note">圆形按钮和新建的卡片、胶囊、圆形共用这组参数；辉光和下面的叠加方式只管圆形按钮。</p>
       <div class="rows" id="rows"></div>
       <div class="seg" id="seg-contrast">
         <button type="button" data-v="off" aria-pressed="true">直接叠加</button>
@@ -513,7 +514,7 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
         <button type="button" class="ghost" data-kind="frosted">磨砂</button>
         <button type="button" class="ghost" data-kind="lens">放大镜</button>
       </div>
-      <p class="note">只是往页面里插入一个带 <code>data-liquid-glass</code> 的元素，SDK 自动接管，拖动也是 SDK 自带的。卡片、胶囊、圆形是同一种材质，拖到一起会融合。点 × 关闭。</p>
+      <p class="note">只是往页面里插入一个带 <code>data-liquid-glass</code> 的元素，SDK 自动接管，拖动也是 SDK 自带的。卡片、胶囊、圆形用上面的玻璃参数（默认透明、不磨砂），是同一种材质，拖到一起会融合；深色、磨砂、放大镜用各自的预设。点 × 关闭。</p>
     </div>
 
     <div class="grp">
@@ -627,7 +628,7 @@ $('#tryForm').addEventListener('submit', (e) => {
 LiquidGlass.config({ engine: 'auto', captureScale: 0.5 });
 const orb = $('#orb');
 const ringSvg = $('#ring');
-const DEF = { dim: 15, bezel: 6, refract: 45, disp: 12, frost: 1.0, spec: 100, glow: 100 };
+const DEF = { dim: 15, bezel: 6, refract: 30, disp: 13, frost: 0, spec: 100, glow: 100 };
 const P = { ...DEF };
 const D = vw < 640 ? 132 : 176;
 document.documentElement.style.setProperty('--d', D + 'px');
@@ -837,11 +838,11 @@ const ICONS = {
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>',
 };
 const KINDS = {
-  card: { cls: 'gp-card adapt', glass: 'regular; draggable: true; pointer: true; adaptive: true',
+  card: { cls: 'gp-card adapt', flags: 'draggable: true; pointer: true; adaptive: true',
     html: `<div class="row-h"><h4>通知</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>这块面板只是一个带 data-liquid-glass 的 div，插进页面就自动变成了玻璃。拖动它试试。</p>` },
-  pill: { cls: 'gp-pill adapt', glass: 'regular; bezel: 0.2; draggable: true; button: true; adaptive: true',
+  pill: { cls: 'gp-pill adapt', flags: 'draggable: true; button: true; adaptive: true',
     html: `<button type="button" class="ib" aria-label="上一首">${ICONS.prev}</button><button type="button" class="ib" aria-label="播放">${ICONS.play}</button><button type="button" class="ib" aria-label="下一首">${ICONS.next}</button><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button>` },
-  round: { cls: 'gp-round adapt', glass: 'regular; bezel: 0.08; draggable: true; button: true; adaptive: true',
+  round: { cls: 'gp-round adapt', flags: 'draggable: true; button: true; adaptive: true',
     html: `<button type="button" class="x" aria-label="关闭面板">${ICONS.plus}</button>` },
   dark: { cls: 'gp-dark', glass: 'dark; draggable: true; pointer: true',
     html: `<div class="row-h"><h4>深色面板</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>preset: dark，压暗 35%。白字压在任何背景上都清楚。</p>` },
@@ -849,12 +850,18 @@ const KINDS = {
     html: `<div class="row-h"><h4>磨砂面板</h4><button type="button" class="x" aria-label="关闭面板">${ICONS.close}</button></div><p>preset: frosted，背后的内容只剩颜色。</p>` },
   lens: { cls: 'gp-lens', glass: 'lens; draggable: true', html: '' },
 };
+// card, pill and round take the sheet's glass settings (the orb's material), so they fuse with each other
+function sheetGlass(K) {
+  const o = glassOpts();
+  return 'clear; ' + Object.keys(o).map((k) => k + ': ' + +o[k].toFixed(3)).join('; ') + '; ' + K.flags;
+}
 let spawnCount = 0;
 function spawn(kind) {
   const K = KINDS[kind];
   const el = document.createElement('div');
   el.className = 'gp spawned ' + K.cls;
-  el.setAttribute('data-liquid-glass', K.glass);
+  if (K.flags) el.dataset.kind = kind;
+  el.setAttribute('data-liquid-glass', K.flags ? sheetGlass(K) : K.glass);
   el.innerHTML = K.html;
   // lay new panels out in a loose grid so they do not pile up
   const n = spawnCount++;
@@ -884,9 +891,14 @@ const ROWS = [
 ];
 const paintRange = (inp) => inp.style.setProperty('--pct', ((inp.value - inp.min) / (inp.max - inp.min) * 100) + '%');
 let applyTimer = 0;
+function applyGlassNow() {
+  clearTimeout(applyTimer);
+  orbGlass.set(glassOpts());
+  document.querySelectorAll('.spawned[data-kind]').forEach((el) => el.setAttribute('data-liquid-glass', sheetGlass(KINDS[el.dataset.kind])));
+}
 function applyGlass() {
   clearTimeout(applyTimer);
-  applyTimer = setTimeout(() => orbGlass.set(glassOpts()), LiquidGlass.engine === 'native' ? 90 : 0);
+  applyTimer = setTimeout(applyGlassNow, LiquidGlass.engine === 'native' ? 90 : 0);
 }
 for (const r of ROWS) {
   const row = document.createElement('div');
@@ -943,7 +955,7 @@ function setContrast(m) {
 $('#seg-contrast').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setContrast(b.dataset.v); });
 $('#p-auto').addEventListener('change', (e) => setPlaying(e.target.checked));
 $('#p-reset').addEventListener('click', () => {
-  Object.assign(P, DEF); syncRows(); setGlow(); orbGlass.set(glassOpts());
+  Object.assign(P, DEF); syncRows(); setGlow(); applyGlassNow();
   setContrast('off'); setEngine('auto');
   setSeg($('#seg-scale'), '0.5'); setSeg($('#seg-cap'), 'fast');
   LiquidGlass.config({ captureScale: 0.5, capturer: 'fast' });
