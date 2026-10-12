@@ -854,6 +854,11 @@ async function fastCapture(M, scale, W, H, unreadable) {
   const bdiv = document.createElement('div');
   for (const a of clone.attributes) bdiv.setAttribute(a.name, a.value);
   bdiv.setAttribute('class', ((clone.getAttribute('class') || '') + ' lg-body').trim());
+  // body's margins can come from the browser's own stylesheet (8px), which the copied CSS does not carry: give
+  // the stand-in div the live values, so the clone lays out exactly like the page (the snapshot's origin is the
+  // root element, see captureBody)
+  const bcs = getComputedStyle(body);
+  bdiv.style.margin = `${bcs.marginTop} ${bcs.marginRight} ${bcs.marginBottom} ${bcs.marginLeft}`;
   while (clone.firstChild) bdiv.appendChild(clone.firstChild);
   root.appendChild(bdiv);
 
@@ -888,10 +893,13 @@ async function fastCapture(M, scale, W, H, unreadable) {
 }
 
 async function captureBody(M, scale) {
-  const body = document.body;
-  const rect = body.getBoundingClientRect();
+  const body = document.body, html = document.documentElement;
+  // The snapshot is the page from the root element's box down (both capturers draw the root element). body's own
+  // box can sit off it (its margins, or a first child's margin collapsing through it), and every sample would
+  // land that far off.
+  const rect = html.getBoundingClientRect();
   const width = Math.ceil(rect.width);
-  const height = Math.ceil(Math.max(rect.height, body.scrollHeight));
+  const height = Math.ceil(Math.max(rect.height, html.scrollHeight, body.scrollHeight));
   const lim = M.renderer ? M.renderer.maxTex * 0.98 : 4096;
   scale = Math.min(scale, lim / width, lim / height);
   let bgc = getComputedStyle(body).backgroundColor;
@@ -916,10 +924,10 @@ async function captureBody(M, scale) {
     const key = [scale.toFixed(4), width, height, bgc].join('|');
     if (ms.createContext && (!M.msCtx || M.msKey !== key)) {
       if (M.msCtx && ms.destroyContext) { try { ms.destroyContext(M.msCtx); } catch (err) { /* ignore */ } }
-      M.msCtx = await ms.createContext(body, opts);
+      M.msCtx = await ms.createContext(document.documentElement, opts);
       M.msKey = key;
     }
-    canvas = M.msCtx ? await ms.domToCanvas(M.msCtx) : await ms.domToCanvas(body, opts);
+    canvas = M.msCtx ? await ms.domToCanvas(M.msCtx) : await ms.domToCanvas(document.documentElement, opts);
   }
   const sc = canvas.width / width;
   const holes = collectHoles(ox, oy, unreadable);
@@ -1035,9 +1043,9 @@ const FILTER_HALO = `
     <feFuncA type="linear" slope="0" intercept="1"/>
   </feComponentTransfer>
   <feComposite in="glass" in2="fac" operator="arithmetic" k1="1" k2="0" k3="0" k4="0"/>`;
-// shared backplate of fused glass: the map's B channel is the merged outline, everything outside it is cut away
+// shared backplate of fused glass: a coverage image (alpha) is the merged outline, everything outside it is cut away
 const FILTER_MASK = `
-  <feColorMatrix in="map" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 1 0 0" result="cov"/>
+  <feImage class="mapc" x="0" y="0" preserveAspectRatio="none" result="cov"/>
   <feComposite in="glass" in2="cov" operator="in"/>`;
 
 function makeFilter(M, id, tail) {
@@ -1051,16 +1059,41 @@ function makeFilter(M, id, tail) {
   M.defs().appendChild(f);
   return f;
 }
-function setFilterState(f, w, h, url, scale, P) {
+function setFilterState(f, w, h, maps, scale, P) {
   const q = (sel) => f.querySelector(sel);
-  for (const el of [f, q('.map')]) { el.setAttribute('width', w); el.setAttribute('height', h); }
-  q('.map').setAttribute('href', url);
+  for (const el of [f, q('.map'), q('.mapc')]) if (el) { el.setAttribute('width', w); el.setAttribute('height', h); }
+  q('.map').setAttribute('href', maps.m);
+  if (maps.c) q('.mapc').setAttribute('href', maps.c);
   q('.dr').setAttribute('scale', (scale * (1 - P.disp)).toFixed(3));
   q('.dg').setAttribute('scale', scale.toFixed(3));
   q('.db').setAttribute('scale', (scale * (1 + P.disp)).toFixed(3));
   q('.blur').setAttribute('stdDeviation', P.frost.toFixed(2));
   q('.sat').setAttribute('values', String(P.sat));
   f.querySelectorAll('.dim').forEach((n) => n.setAttribute('slope', (1 - P.dim).toFixed(3)));
+}
+
+// The displacement map holds the x / y offsets in R / G. The plate's coverage is a second image, white with
+// the coverage as alpha: Chrome colour-manages filter images into the display's colour space, and on a
+// wide-gamut screen that mixes the channels of a coloured pixel. The coverage used to be the map's blue
+// channel, and the "no glass" pixel (128,128,0) came out with a blue of about 0.15 there, which dimmed the
+// plate's whole box; alpha is never converted.
+// ox, oy, cov: 0..255 per map px (cov null: no coverage image).
+const MAP_RANGE = 2.02;
+function encodeMaps(canvas, nw, nh, ox, oy, cov) {
+  if (canvas.width !== nw) canvas.width = nw;
+  if (canvas.height !== nh) canvas.height = nh;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const img = ctx.createImageData(nw, nh), d = img.data;
+  const out = {};
+  for (let k = 0, o = 0; k < nw * nh; k++, o += 4) { d[o] = ox[k]; d[o + 1] = oy[k]; d[o + 2] = 128; d[o + 3] = 255; }
+  ctx.putImageData(img, 0, 0);
+  out.m = canvas.toDataURL();
+  if (cov) {
+    for (let k = 0, o = 0; k < nw * nh; k++, o += 4) { d[o] = d[o + 1] = d[o + 2] = 255; d[o + 3] = cov[k]; }
+    ctx.putImageData(img, 0, 0);
+    out.c = canvas.toDataURL();
+  }
+  return out;
 }
 
 // CSS colour -> [r, g, b, a] in 0..1 (anything the canvas understands; unknown -> transparent)
@@ -1407,10 +1440,6 @@ class Glass {
     // displacement map over the element box
     const sc = Math.min(dpr, 600 / Math.max(G.w, G.h));
     const nw = Math.max(8, Math.round(G.w * sc)), nh = Math.max(8, Math.round(G.h * sc));
-    const mc = document.createElement('canvas');
-    mc.width = nw; mc.height = nh;
-    const mctx = mc.getContext('2d', { willReadFrequently: true });
-    const map = mctx.createImageData(nw, nh);
     const dx = new Float32Array(nw * nh), dy = new Float32Array(nw * nh);
     let maxD = 0.5;
     // only the bezel refracts: skip the flat middle
@@ -1428,18 +1457,17 @@ class Glass {
         maxD = Math.max(maxD, Math.abs(o.dx), Math.abs(o.dy));
       }
     }
-    const scale = maxD * 2.02;
+    const scale = maxD * MAP_RANGE;
+    const mx = new Uint8Array(nw * nh), my = new Uint8Array(nw * nh);
     for (let k = 0; k < nw * nh; k++) {
-      map.data[k * 4] = Math.round(255 * clamp(0.5 + dx[k] / scale, 0, 1));
-      map.data[k * 4 + 1] = Math.round(255 * clamp(0.5 + dy[k] / scale, 0, 1));
-      map.data[k * 4 + 2] = 128;
-      map.data[k * 4 + 3] = 255;
+      mx[k] = Math.round(255 * clamp(0.5 + dx[k] / scale, 0, 1));
+      my[k] = Math.round(255 * clamp(0.5 + dy[k] / scale, 0, 1));
     }
-    mctx.putImageData(map, 0, 0);
+    const maps = encodeMaps(document.createElement('canvas'), nw, nh, mx, my, null);
     // highlights and shadow: WebGL when available (see update), otherwise once on the CPU
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     if (!this.M.renderer) this.paintOverlayCPU();
-    this.nativeMap = { url: mc.toDataURL(), scale };
+    this.nativeMap = { maps, scale };
     this.commitNative();
   }
 
@@ -1480,7 +1508,7 @@ class Glass {
     const f = this.filters[this.fi ^ 1];
     const on = !!(P.contrast === 'halo' && this.haloCanvas && P.glyphDark < 0.5);
     if ((f.getAttribute('data-halo') === '1') !== on) { f.innerHTML = FILTER_CORE + (on ? FILTER_HALO : ''); f.setAttribute('data-halo', on ? '1' : '0'); }
-    setFilterState(f, G.w, G.h, this.nativeMap.url, this.nativeMap.scale, P);
+    setFilterState(f, G.w, G.h, this.nativeMap.maps, this.nativeMap.scale, P);
     if (on) {
       const halo = f.querySelector('.halo');
       halo.setAttribute('width', G.w); halo.setAttribute('height', G.h);
@@ -1789,7 +1817,7 @@ class Plate {
     if (bf !== this.bf) { this.bf = bf; this.el.style.backdropFilter = bf; this.el.style.webkitBackdropFilter = bf; }
   }
 
-  // native: refraction map of the merged outline (R/G offset, B coverage), written into the filter copy that
+  // native: refraction map of the merged outline (x offset grey, y offset alpha) and its coverage, written into the filter copy that
   // is not on screen and swapped in by update()
   buildMap(D, W, H) {
     const M = this.M;
@@ -1798,20 +1826,14 @@ class Plate {
     const sc = Math.min(1, 1400 / Math.max(W, H), Math.sqrt(1e6 / (W * H)));
     const nw = Math.max(8, Math.round(W * sc)), nh = Math.max(8, Math.round(H * sc));
     const sx = W / nw, sy = H / nh, px = (sx + sy) / 2;
+    // a CPU canvas: the maps only go through putImageData and toDataURL, a GPU one would upload and read back
     const c = this.mapCanvas || (this.mapCanvas = document.createElement('canvas'));
-    if (c.width !== nw) c.width = nw;
-    if (c.height !== nh) c.height = nh;
-    // a CPU canvas: the map only goes through putImageData and toDataURL, a GPU one would upload and read back
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    const img = ctx.createImageData(nw, nh), data = img.data;
     const U = new UnionField(D);
     let bez = 0, mMax = 0;
     for (const d of D) { bez = Math.max(bez, d.P.bezel); mMax = Math.max(mMax, d.m); }
     const inner = Math.max(bez * mMax, 0.5) + px;
-    // flat glass is offset 0 (128) with the coverage in B; offsets (css px) are kept for the bezel band only
-    const u32 = new Uint32Array(data.buffer), le = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
-    const OUT = le ? 0xff008080 : 0x808000ff, IN = le ? 0xffff8080 : 0x8080ffff;
-    u32.fill(OUT);
+    // flat glass is offset 0 (128) with full coverage; offsets (css px) are kept for the bezel band only
+    const mx = new Uint8Array(nw * nh).fill(128), my = new Uint8Array(nw * nh).fill(128), cov = new Uint8Array(nw * nh);
     const band = [], bdx = [], bdy = [];
     let maxD = 0.5;
     // 8x8 blocks that are clearly outside, or clearly inside the bezel, need no per-pixel work
@@ -1822,13 +1844,13 @@ class Plate {
         const kind = U.classify((bx + bw / 2) * sx, (by + bh / 2) * sy, 0.5 * Math.hypot(bw * sx, bh * sy), px, inner);
         if (kind === 1) continue;
         for (let j = by; j < by + bh; j++) {
-          if (kind === -1) { u32.fill(IN, j * nw + bx, j * nw + bx + bw); continue; }
+          if (kind === -1) { cov.fill(255, j * nw + bx, j * nw + bx + bw); continue; }
           for (let i = bx; i < bx + bw; i++) {
             const sd = U.at((i + 0.5) * sx, (j + 0.5) * sy);
             const a = 0.5 - sd / px;
             if (a <= 0) continue;
             const k = j * nw + i;
-            data[k * 4 + 2] = a >= 1 ? 255 : Math.round(255 * a);
+            cov[k] = a >= 1 ? 255 : Math.round(255 * a);
             const P = U.uP;
             if (-sd >= Math.max(P.bezel * U.um, 0.5)) continue;   // past the bezel the glass is flat
             const o = opticsAt(sd, U.unx, U.uny, U.um, P, false);
@@ -1839,15 +1861,13 @@ class Plate {
         }
       }
     }
-    const scale = maxD * 2.02;
+    const scale = maxD * MAP_RANGE;
     for (let q = 0; q < band.length; q++) {
-      const o = band[q] * 4;
-      data[o] = Math.round(255 * clamp(0.5 + bdx[q] / scale, 0, 1));
-      data[o + 1] = Math.round(255 * clamp(0.5 + bdy[q] / scale, 0, 1));
+      mx[band[q]] = Math.round(255 * clamp(0.5 + bdx[q] / scale, 0, 1));
+      my[band[q]] = Math.round(255 * clamp(0.5 + bdy[q] / scale, 0, 1));
     }
-    ctx.putImageData(img, 0, 0);
     if (!this.filters) { this.filters = [makeFilter(M, this.id + 'a', FILTER_MASK), makeFilter(M, this.id + 'b', FILTER_MASK)]; this.fi = 0; }
-    setFilterState(this.filters[this.fi ^ 1], W, H, c.toDataURL(), scale, D[0].P);
+    setFilterState(this.filters[this.fi ^ 1], W, H, encodeMaps(c, nw, nh, mx, my, cov), scale, D[0].P);
     this.fi ^= 1;
   }
 

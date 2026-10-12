@@ -169,9 +169,11 @@ LiquidGlass.presets / LiquidGlass.defaults
 `backdrop-filter: url(#svg-filter)`：根据光学模型（斯涅尔折射 + 超椭圆边缘高度场）在 CPU 上生成一张位移图，交给 `feDisplacementMap`，RGB 三个通道用不同的位移量实现色散。
 **浏览器自己实时折射页面**，所以 iframe、视频、动画都是真的，不需要截图，性能最好。
 
+融合背板的形状（哪里有玻璃）放在一张只用 alpha 通道的图里。Chrome 会把滤镜里的图片转换到显示器的色彩空间，在广色域屏幕（比如 Mac 的 Display P3）上彩色像素的三个通道会互相掺杂：以前形状放在位移图的蓝色通道里，表示“这里没有玻璃”的像素转换后带上约 15% 的覆盖，把整块背板矩形压暗一层。alpha 通道不参与色彩转换。
+
 ### snapshot 引擎（Safari / Firefox）
 
-1. 把页面 DOM 克隆一份，通过 SVG `foreignObject` 画进一张低分辨率 canvas（默认 0.5×），上传为 WebGL2 纹理。
+1. 把页面 DOM 克隆一份，通过 SVG `foreignObject` 画进一张低分辨率 canvas（默认 0.5×），上传为 WebGL2 纹理。快照从根元素（`<html>`）的左上角算起；`<body>` 换成一个 div 时会带上它在页面里实际的外边距（包括浏览器默认的 8px），所以快照里的排版和页面一致，采样位置不会错开。
 2. 只有**边缘折射带**由 WebGL shader 从快照里采样、折射、色散；**中间大部分区域**仍然用 CSS `backdrop-filter` 显示实时页面。快照有一点延迟也看不出来。
 3. 快照拍不到的区域会被**挖空**（透明）。shader 在挖空的地方不折射，改画一圈玻璃拟态高光。
 4. 拖动、滚动只改变采样位置，不重新截图。只有 DOM 变化、表单输入、图片加载、字体加载、视口宽度变化时才重拍（只有高度变了，比如 iOS 地址栏收起，不重拍）。重拍会节流：间隔 ≥ 250ms，且 ≥ 上次截图耗时的 4 倍，放在 `requestIdleCallback` 里执行；按着指针或正在滚动时会等到停下来再拍（最多等 1.5 秒）。
@@ -240,6 +242,7 @@ npx wrangler deploy
 - 融合和折射几何不考虑元素的旋转（`translate`、`scale` 没问题）。
 - 玻璃的投影会超出元素边界，祖先元素上的 `overflow: hidden` 会把它裁掉。
 - Safari 和 iOS / iPadOS 上的所有浏览器，在**跨域 iframe** 里（比如嵌在别的网站或预览窗口里），用户第一次轻点或点击之前会把 `requestAnimationFrame` 降到 30 fps，而且拖动不算点击（[WebKit 170534](https://bugs.webkit.org/show_bug.cgi?id=170534)、[213344](https://bugs.webkit.org/show_bug.cgi?id=213344)）。这时 SDK 改由指针移动驱动帧：每次 `pointermove` 先运行页面排队的动画回调，再绘制玻璃，每次屏幕刷新最多一帧，拖动仍是满帧率。不在跨域 iframe 里、Chromium、或者用户已经点过一下时，这个机制不会启用。
+- native 引擎在广色域屏幕（Display P3）上的 Chrome 里，位移图的 R/G 通道也会被色彩转换掺杂，折射方向会有些偏差（x、y 互相串一点）。单块玻璃的形状和融合背板不受影响。改成只用灰度和 alpha 的编码要么精度不够、要么在强折射处出错，还没有合适的办法。
 - 尚未在真实的 Safari / iOS 设备上完整测试，欢迎反馈。
 
 ## 浏览器支持
