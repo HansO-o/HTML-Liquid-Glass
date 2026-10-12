@@ -203,7 +203,7 @@ footer { max-width: 1100px; margin: 90px auto 0; padding: 26px 20px 50px; border
     <div class="feats">
       <div class="feat"><h3>原生滤镜 · Chromium</h3><p>backdrop-filter 加 SVG 位移图，按斯涅尔折射和超椭圆边缘生成。浏览器实时折射页面，iframe、视频、动画都是真的。</p></div>
       <div class="feat"><h3>快照 + WebGL · Safari / Firefox</h3><p>只有边缘那一圈从页面快照折射，中间仍是实时页面。拖动、滚动不重拍，拍不到的区域自动挖空。</p></div>
-      <div class="feat"><h3>只有一个 WebGL 上下文</h3><p>所有玻璃共用一个 WebGL 上下文画高光和投影，玻璃再多也不会碰到浏览器的上下文数量限制。</p></div>
+      <div class="feat"><h3>滚动不卡</h3><p>Safari / Firefox 里每块玻璃直接画在自己的 WebGL 画布上，不从 GPU 读回像素；最多 12 块，其余共用一个，玻璃再多也不会碰到浏览器的上下文数量限制。滚动时不截图。</p></div>
       <div class="feat"><h3>跟手</h3><p>每帧的测量和绘制排在页面自己的动画之后；在 Safari 的跨域 iframe 里动画被降到 30 fps 时，改由手指的移动来驱动。</p></div>
     </div>
   </section>
