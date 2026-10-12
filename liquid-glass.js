@@ -227,6 +227,7 @@ uniform float uFuseTop[8];   // 1 when that neighbour is painted above this glas
 uniform vec4 uFuseTint[8];   // that neighbour's CSS background colour (straight alpha)
 uniform vec4 uFuseOpt[8];    // that neighbour's bezel, thickness, curve, spec
 uniform vec4 uFuseOpt2[8];   // that neighbour's shadow, ior, gap, and how far its canvas reaches past its box
+uniform float uPageS;        // page px per local css px of this glass (its CSS scale)
 uniform int uFuseN;
 uniform vec4 uTintSelf;      // this glass's CSS background colour
 uniform float uOwnTint;      // 1 while this glass hosts the backplate: its CSS background is off, painted here
@@ -355,8 +356,10 @@ void main() {
     // Each canvas only reaches its own box plus its pad, sized for its own shadow, while the merged shadow can
     // reach further: a pixel the nearer glass cannot draw goes to one that can. Both sides use the same 1px fade
     // just inside a canvas's edge, so the shares still add up to 1 there.
+    // All ramps are measured in page px (uPageS: page px per local px), so glass scaled differently agrees.
+    float hs = 0.5 * uPageS;
     vec2 qs = abs(p) - uHalf - uPad;
-    float canSelf = clamp(-max(qs.x, qs.y) - 0.5, 0.0, 1.0);
+    float canSelf = clamp(-max(qs.x, qs.y) * uPageS - 0.5, 0.0, 1.0);
     float wIn = 1.0, wOut = 1.0;
     float uncovered = clamp(0.5 + sdSelf * uDpr, 0.0, 1.0);
     for (int i = 0; i < 8; i++) {
@@ -364,15 +367,15 @@ void main() {
       vec2 nj;
       float sj = rrSd(p - uFuse[i].xy, uFuse[i].zw, uFuseR[i], nj);
       vec2 qj = abs(p - uFuse[i].xy) - uFuse[i].zw - uFuseOpt2[i].w;
-      float canJ = clamp(-max(qj.x, qj.y) - 0.5, 0.0, 1.0);        // that glass's canvas reaches here
-      float outJ = clamp(0.5 + sj * 0.5, 0.0, 1.0);
+      float canJ = clamp(-max(qj.x, qj.y) * uPageS - 0.5, 0.0, 1.0);   // that glass's canvas reaches here
+      float outJ = clamp(0.5 + sj * hs, 0.0, 1.0);
       if (uFuseTop[i] < 0.5) wIn *= outJ;                         // inside a glass painted lower: that one draws
-      else upClaim = max(upClaim, canJ * max(clamp(1.5 - sj * 0.5, 0.0, 1.0), clamp(1.5 + (sdSelf - sj) * 0.5, 0.0, 1.0)));
+      else upClaim = max(upClaim, canJ * max(clamp(1.5 - sj * hs, 0.0, 1.0), clamp(1.5 + (sdSelf - sj) * hs, 0.0, 1.0)));
       // outside every box: the nearest draws (if its canvas reaches)
-      wOut *= outJ * mix(1.0, clamp(0.5 + (sj - sdSelf) * 0.5, 0.0, 1.0), canJ);
+      wOut *= outJ * mix(1.0, clamp(0.5 + (sj - sdSelf) * hs, 0.0, 1.0), canJ);
       uncovered *= clamp(0.5 + sj * uDpr, 0.0, 1.0);
     }
-    float inSelf = clamp(0.5 - sdSelf * 0.5, 0.0, 1.0);
+    float inSelf = clamp(0.5 - sdSelf * hs, 0.0, 1.0);
     share = (inSelf * wIn + (1.0 - inSelf) * wOut) * canSelf;
     // (a glass above may still need this one's opaque part under it, see wMat below)
     if (share <= 0.0 && upClaim * (uSnapFill > 1.5 ? 1.0 : uSnapFill > 0.5 ? uncovered : 0.0) <= 0.0) { o = vec4(0.0); return; }
@@ -502,7 +505,7 @@ void main() {
 const UNIFORMS = ['uSnap', 'uHaloTex', 'uSnapSize', 'uCenterSnap', 'uCanvasPx', 'uHalf', 'uLight', 'uTouch', 'uShadowGeom', 'uA',
   'uSnapScale', 'uDpr', 'uRad', 'uPad', 'uBezel', 'uK', 'uThick', 'uIor', 'uGap', 'uDisp', 'uFrost', 'uSpec',
   'uTint', 'uSat', 'uDim', 'uShadow', 'uTouchAmt', 'uHalo', 'uGlyphDark', 'uNative', 'uOther', 'uOtherR', 'uOtherN',
-  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseOpt', 'uFuseOpt2', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uSnapFill', 'uBlend', 'uPress'];
+  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseOpt', 'uFuseOpt2', 'uPageS', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uSnapFill', 'uBlend', 'uPress'];
 
 class Renderer {
   constructor(canvas) {
@@ -544,7 +547,8 @@ class Renderer {
   makeTex() {
     const gl = this.gl, t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
-    // no mipmaps: generating them is the slow part on weak GPUs, the shader blurs with taps instead
+    // no mipmaps by default: generating them is the slow part on weak GPUs, the shader blurs with taps instead
+    // (only heavily frosted fused glass in the snapshot engine builds them, see ensureMips)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -683,11 +687,14 @@ class Renderer {
     gl.uniform4fv(U.uFuseTint, fc);
     gl.uniform4fv(U.uFuseOpt, fo);
     gl.uniform4fv(U.uFuseOpt2, fo2);
+    gl.uniform1f(U.uPageS, sA);
     gl.uniform1i(U.uFuseN, fuse.length);
     gl.uniform4fv(U.uTintSelf, g.tint);
     // snapFused 3 (overlapping, backdrops off) paints like 1: only the dimming and the bridges
     const fill = snap && !native && fuse.length ? (g.snapFused === 3 ? 1 : g.snapFused) : 0;
-    if (fill && P.frost >= 0.15) this.ensureMips();
+    // 3: the page under the boxes is not saturated or frosted (backdrops off), so neither are the rim and bridges
+    if (fill && g.snapFused === 3) { gl.uniform1f(U.uSat, 1); gl.uniform1f(U.uFrost, 0); }
+    if (fill && P.frost * snap.scale > 2) this.ensureMips();   // bgFlat only reads mip levels above that
     // painting all of the merged shape covers the glass's own CSS background, so the canvas paints it on top
     gl.uniform1f(U.uOwnTint, g.bgHold || fill === 2 ? 1 : 0);
     gl.uniform1f(U.uSnapFill, fill);
@@ -2018,11 +2025,17 @@ class Manager {
         // 1: no two boxes overlap, each keeps its own backdrop (without the dimming); 3: some overlap, and two
         // stacked backdrops would filter the overlap twice, so they are off (the page is only dimmed);
         // 2: frosted, painted from the snapshot
+        // (rounded boxes: they overlap when their inner rectangles are closer than the two radii)
+        const B = members.map((g) => {
+          const s = g.frameScale(), G = g.geom, hw = G.hw * s, hh = G.hh * s, r = Math.min(G.r * s, hw, hh);
+          return { cx: g.frame.cx, cy: g.frame.cy, iw: hw - r, ih: hh - r, r };
+        });
         let stacked = false;
-        for (let i = 0; i < members.length && !stacked; i++) {
-          for (let j = i + 1; j < members.length; j++) {
-            const a = members[i].rect, b = members[j].rect;
-            if (Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5) { stacked = true; break; }
+        for (let i = 0; i < B.length && !stacked; i++) {
+          for (let j = i + 1; j < B.length; j++) {
+            const a = B[i], b = B[j];
+            const dx = Math.max(0, Math.abs(a.cx - b.cx) - a.iw - b.iw), dy = Math.max(0, Math.abs(a.cy - b.cy) - a.ih - b.ih);
+            if (Math.hypot(dx, dy) < a.r + b.r - 0.5) { stacked = true; break; }
           }
         }
         const mode = members[0].p.frost >= SNAP_FILL_FROST ? 2 : stacked ? 3 : 1;
