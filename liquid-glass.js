@@ -43,6 +43,7 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 const ua = navigator.userAgent;
 const IS_CHROMIUM = !!(navigator.userAgentData && navigator.userAgentData.brands &&
   navigator.userAgentData.brands.some((b) => /Chromium/.test(b.brand))) || /\bChrome\/\d+/.test(ua);
+const HAS_SCROLL_TIMELINE = typeof global.ScrollTimeline === 'function';
 
 const PRESETS = {
   clear:   { frost: 1, sat: 1.16, tint: 0.018, dim: 0 },
@@ -92,12 +93,8 @@ const CONFIG = {
   capturer: 'fast',         // 'fast'（内置）| 'modern-screenshot'（需要全局 modernScreenshot）
   embedFonts: false,
   liveFps: 30,
-  // 快照引擎：滚动由浏览器的合成线程完成，玻璃边缘却是主线程按 scrollY 画的，画面送到屏幕时页面已经又滚了一段。
-  // 按滚动速度往前多取这么多毫秒的位置，边缘就跟得上滚动。'auto'：iOS / iPadOS 32，其他 16；0 关闭
-  scrollLead: 'auto',
   auto: true,               // 自动接管 [data-liquid-glass]
 };
-const IS_IOS = /iP(hone|od|ad)/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1);
 
 function isSandbox(node) {
   return node && node.nodeType === 1 && node.tagName === 'IFRAME' && /^__SANDBOX__/.test(node.id || '');
@@ -507,14 +504,10 @@ const UNIFORMS = ['uSnap', 'uHaloTex', 'uSnapSize', 'uCenterSnap', 'uCanvasPx', 
   'uTint', 'uSat', 'uDim', 'uShadow', 'uTouchAmt', 'uHalo', 'uGlyphDark', 'uNative', 'uOther', 'uOtherR', 'uOtherN',
   'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseOpt', 'uFuseOpt2', 'uPageS', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uSnapFill', 'uBlend', 'uPress'];
 
-// own: the canvas is one glass's own and is shown as it is (outside Chromium, see Manager.ownGL); otherwise it is
-// the shared offscreen canvas every glass is copied out of. Both keep their drawing buffer: a glass only redraws
-// when something changed, and WebKit repaints an unchanged canvas from that buffer (it would come up empty)
 class Renderer {
-  constructor(canvas, own) {
+  constructor(canvas) {
     this.canvas = canvas || document.createElement('canvas');
     if (!canvas) { this.canvas.width = 4; this.canvas.height = 4; }
-    this.own = !!own;
     const gl = this.gl = this.canvas.getContext('webgl2', {
       alpha: true, premultipliedAlpha: true, antialias: false, preserveDrawingBuffer: true,
     });
@@ -547,8 +540,6 @@ class Renderer {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
     this.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
     this.snapW = 1; this.snapH = 1;
-    this.snapV = 0;
-    this.liveAt = new WeakMap();   // data-lg-live element -> when it was last patched into this snapshot texture
   }
   makeTex() {
     const gl = this.gl, t = gl.createTexture();
@@ -572,13 +563,6 @@ class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     this.mips = false;
     this.snapW = src.width; this.snapH = src.height;
-  }
-  // the current page snapshot, uploaded the first time this renderer needs it after a capture
-  sync(snap) {
-    if (this.snapV === snap.version) return;
-    this.setSnapshot(snap.canvas);
-    this.snapV = snap.version;
-    this.liveAt = new WeakMap();
   }
   patch(x, y, src) {
     const gl = this.gl;
@@ -606,16 +590,6 @@ class Renderer {
     gl.activeTexture(gl.TEXTURE0);
     return t;
   }
-  // the glass's halo mask as a texture of this renderer (uploaded again after the mask or the renderer changed)
-  haloFor(g) {
-    if (!g.haloCanvas) return null;
-    if (g.haloR !== this || g.haloV !== g.haloVer) {
-      if (g.haloR && g.haloR !== this && g.haloTex) g.haloR.gl.deleteTexture(g.haloTex);
-      g.haloTex = this.haloTexture(g.haloCanvas, g.haloR === this ? g.haloTex : null);
-      g.haloR = this; g.haloV = g.haloVer;
-    }
-    return g.haloTex;
-  }
   // every copy out of the shared canvas copies its whole drawing buffer, so it should not keep the size of the
   // largest glass ever drawn (a panel opened and closed again): after 2 s of being much bigger than every glass
   // on screen (w x h, device px) it shrinks to that. Never below it, so it does not reallocate back and forth
@@ -627,27 +601,22 @@ class Renderer {
 
   draw(g, snap, native) {
     const gl = this.gl, U = this.U, P = g.p, G = g.geom, f = g.frame;
-    const cw = g.pxW, ch = g.pxH;
-    if (this.own) {
-      if (this.canvas.width !== cw) this.canvas.width = cw;
-      if (this.canvas.height !== ch) this.canvas.height = ch;
-    } else if (this.canvas.width < cw || this.canvas.height < ch) {
+    const cw = g.canvas.width, ch = g.canvas.height;
+    if (this.canvas.width < cw || this.canvas.height < ch) {
       this.canvas.width = Math.max(this.canvas.width, cw);
       this.canvas.height = Math.max(this.canvas.height, ch);
     }
-    if (snap) this.sync(snap);
-    const halo = this.haloFor(g);
     gl.viewport(0, 0, cw, ch);
     gl.enable(gl.SCISSOR_TEST);
     gl.scissor(0, 0, cw, ch);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, halo || this.blackTex);
+    gl.bindTexture(gl.TEXTURE_2D, g.haloTex || this.blackTex);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, snap ? this.snapTex : this.blackTex);
     gl.uniform2f(U.uSnapSize, snap ? this.snapW : 1, snap ? this.snapH : 1);
-    gl.uniform2f(U.uCenterSnap, snap ? (f.cx + global.scrollX + f.lx - snap.ox) * snap.scale : 0, snap ? (f.cy + global.scrollY + f.ly - snap.oy) * snap.scale : 0);
+    gl.uniform2f(U.uCenterSnap, snap ? (f.cx + global.scrollX - snap.ox) * snap.scale : 0, snap ? (f.cy + global.scrollY - snap.oy) * snap.scale : 0);
     gl.uniform2f(U.uCanvasPx, cw, ch);
     gl.uniform2f(U.uHalf, G.hw, G.hh);
     gl.uniform2f(U.uLight, LX, LY);
@@ -672,16 +641,16 @@ class Renderer {
     gl.uniform1f(U.uShadow, P.shadow);
     gl.uniform1f(U.uTouchAmt, g.touch.amt);
     // the native engine does the halo inside its SVG filter
-    gl.uniform1f(U.uHalo, !native && snap && P.contrast === 'halo' && halo ? 1 : 0);
+    gl.uniform1f(U.uHalo, !native && snap && P.contrast === 'halo' && g.haloTex ? 1 : 0);
     gl.uniform1f(U.uGlyphDark, P.glyphDark);
     gl.uniform1f(U.uNative, native ? 1 : 0);
     const others = snap ? g.others : [];
     const oa = this.otherBuf || (this.otherBuf = new Float32Array(32));
     const orr = this.otherRBuf || (this.otherRBuf = new Float32Array(8));
     for (let i = 0; i < others.length; i++) {
-      const r = others[i].rect, of = others[i].frame, k = snap.scale;
-      oa[i * 4] = (r.left + r.width / 2 + global.scrollX + of.lx - snap.ox) * k;
-      oa[i * 4 + 1] = (r.top + r.height / 2 + global.scrollY + of.ly - snap.oy) * k;
+      const r = others[i].rect, k = snap.scale;
+      oa[i * 4] = (r.left + r.width / 2 + global.scrollX - snap.ox) * k;
+      oa[i * 4 + 1] = (r.top + r.height / 2 + global.scrollY - snap.oy) * k;
       oa[i * 4 + 2] = r.width / 2 * k; oa[i * 4 + 3] = r.height / 2 * k;
       orr[i] = Math.min(others[i].geom.r * k, r.width / 2 * k, r.height / 2 * k);
     }
@@ -729,7 +698,6 @@ class Renderer {
     gl.uniform1f(U.uBlend, g.blendK());
     gl.uniform1f(U.uPress, g.press || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
-    if (this.own) return;
     g.ctx.clearRect(0, 0, cw, ch);
     g.ctx.drawImage(this.canvas, 0, this.canvas.height - ch, cw, ch, 0, 0, cw, ch);
   }
@@ -907,11 +875,11 @@ async function fastCapture(M, scale, W, H, unreadable) {
   canvas.width = Math.max(1, Math.round(W * scale)); canvas.height = Math.max(1, Math.round(H * scale));
   const ctx = canvas.getContext('2d');
   const paint = () => { ctx.fillStyle = M.bg; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.drawImage(img, 0, 0, canvas.width, canvas.height); };
-  // painting the page image is the slow part: if a scroll started meanwhile, it waits until that stops
-  await M.still();
+  // painting the page image is the slow part: if the page started scrolling meanwhile, it waits for that to stop
+  await M.pageStill();
   paint();
   // WebKit and Gecko sometimes paint images inside foreignObject only on the second draw
-  if (!IS_CHROMIUM) { await new Promise((r) => setTimeout(r, 120)); await M.still(); paint(); }
+  if (!IS_CHROMIUM) { await new Promise((r) => setTimeout(r, 120)); await M.pageStill(); paint(); }
   // tiny copy for the luminance grid, rasterised straight from the SVG (no read-back of the big canvas)
   const lc = document.createElement('canvas');
   lc.width = LUM_W; lc.height = Math.max(1, Math.round(LUM_W * H / W));
@@ -979,14 +947,14 @@ class Capturer {
     const delay = Math.max(16, this.next - performance.now());
     const go = () => {
       this.timer = 0;
-      // a capture blocks the main thread for a while (and Safari has no requestIdleCallback): never while the
-      // page scrolls (the snapshot is in page coordinates, scrolling does not make it stale, and the rim would
-      // stop following the page), and not while a pointer is down unless that goes on for more than 1.5 s
-      const now = performance.now();
-      if (this.M.scrolling(now)) { this.timer = setTimeout(go, 100); return; }
-      if (this.M.pointers.size) {
+      // a capture blocks the main thread for a while (and Safari has no requestIdleCallback): not while the page
+      // scrolls (up to 10 s: the snapshot is in page coordinates, so scrolling does not make it stale), nor while a
+      // pointer is down or something inside the page scrolls (up to 1.5 s: either may be changing what it shows)
+      const now = performance.now(), M = this.M;
+      const page = M.pageScrolling(now);
+      if (page || M.pointers.size || now - M.scrollAt < 250) {
         if (!this.heldSince) this.heldSince = now;
-        if (now - this.heldSince < 1500) { this.timer = setTimeout(go, 250); return; }
+        if (now - this.heldSince < (page ? 10000 : 1500)) { this.timer = setTimeout(go, 100); return; }
       }
       this.heldSince = 0;
       this.waiting = true;
@@ -1152,10 +1120,6 @@ function parseColor(str) {
 }
 
 // ------------------------------------------------------------------ one glass element
-const CANVAS_STYLE = { position: 'absolute', zIndex: '-1', pointerEvents: 'none', display: 'block', margin: '0' };
-// at most this many glasses get a WebGL canvas of their own (browsers keep about 16 WebGL contexts per page and
-// drop the oldest beyond that, and the page may have some of its own); the rest share one
-const MAX_OWN_GL = 12;
 let uid = 0;
 class Glass {
   constructor(M, el, opts) {
@@ -1166,8 +1130,7 @@ class Glass {
     this.p = resolveOptions(this.user);
     this.touch = { amt: 0, x: 0, y: 0 };
     this.ptr = null;
-    this.frame = { cx: 0, cy: 0, A: [1, 0, 0, 1], lx: 0, ly: 0 };
-    this.kx = -1; this.ky = -1; this.lastCX = 0; this.lastCY = 0;   // how much of a page scroll it does not follow
+    this.frame = { cx: 0, cy: 0, A: [1, 0, 0, 1] };
     this.others = [];
     this.fuse = [];
     this.plate = null;         // shared backplate while fused with other glass
@@ -1183,8 +1146,7 @@ class Glass {
     this.key = '';
     this.dirty = true;
     this.luminance = null;
-    this.haloTex = null; this.haloR = null; this.haloCanvas = null; this.haloUrl = ''; this.haloVer = 0; this.haloV = -1;
-    this.glc = null; this.R = null;    // own WebGL canvas and renderer (Manager.ownGL)
+    this.haloTex = null; this.haloCanvas = null; this.haloUrl = '';
     this.saved = {
       position: el.style.position, isolation: el.style.isolation, backgroundImage: el.style.backgroundImage,
       backdropFilter: el.style.backdropFilter, webkitBackdropFilter: el.style.webkitBackdropFilter,
@@ -1196,7 +1158,7 @@ class Glass {
     this.canvas = document.createElement('canvas');
     this.canvas.setAttribute('data-lg-ignore', '');
     this.canvas.setAttribute('aria-hidden', 'true');
-    Object.assign(this.canvas.style, CANVAS_STYLE);
+    Object.assign(this.canvas.style, { position: 'absolute', zIndex: '-1', pointerEvents: 'none', display: 'block', margin: '0' });
     el.insertBefore(this.canvas, el.firstChild);
     this.ctx = this.canvas.getContext('2d');
     this.ro = new ResizeObserver((es) => {
@@ -1379,45 +1341,13 @@ class Glass {
   layoutCanvas() {
     const G = this.geom, dpr = this.M.dpr;
     this.cssW = G.w + G.pad * 2; this.cssH = G.h + G.pad * 2;
-    const cw = this.pxW = Math.max(2, Math.round(this.cssW * dpr)), ch = this.pxH = Math.max(2, Math.round(this.cssH * dpr));
-    // with a WebGL canvas of its own, the 2D canvas is hidden and keeps no pixels
-    for (const c of [this.canvas, this.glc]) {
-      if (!c) continue;
-      const on = c === (this.glc || this.canvas);
-      if (c.width !== (on ? cw : 1)) c.width = on ? cw : 1;
-      if (c.height !== (on ? ch : 1)) c.height = on ? ch : 1;
-      Object.assign(c.style, {
-        display: on ? 'block' : 'none',
-        left: -(G.pad + G.bl) + 'px', top: -(G.pad + G.bt) + 'px',
-        width: this.cssW + 'px', height: this.cssH + 'px',
-      });
-    }
-  }
-
-  // Outside Chromium each glass draws into a WebGL canvas of its own (see Manager.ownGL)
-  attachGL() {
-    const M = this.M;
-    const c = document.createElement('canvas');
-    c.setAttribute('data-lg-ignore', '');
-    c.setAttribute('aria-hidden', 'true');
-    Object.assign(c.style, CANVAS_STYLE);
-    let R;
-    try { R = new Renderer(c, true); } catch (err) { M.ownGL = false; return; }
-    // lost (the browser keeps only so many contexts, or the GPU reset): this glass goes back to the shared one
-    c.addEventListener('webglcontextlost', () => { if (this.glc === c) { this.glLost = true; this.dirty = true; } });
-    this.el.insertBefore(c, this.canvas);
-    this.glc = c; this.R = R; M.ownCount++;
-    this.layoutCanvas();
-    this.key = ''; this.dirty = true;
-  }
-  dropGL() {
-    if (!this.R) return;
-    const ext = this.R.gl.getExtension('WEBGL_lose_context');
-    if (ext) ext.loseContext();   // frees it now instead of whenever the canvas is collected
-    this.glc.remove();
-    this.glc = null; this.R = null; this.M.ownCount--;
-    if (this.geom) this.layoutCanvas();
-    this.key = ''; this.dirty = true;
+    const cw = Math.max(2, Math.round(this.cssW * dpr)), ch = Math.max(2, Math.round(this.cssH * dpr));
+    if (this.canvas.width !== cw) this.canvas.width = cw;
+    if (this.canvas.height !== ch) this.canvas.height = ch;
+    Object.assign(this.canvas.style, {
+      left: -(G.pad + G.bl) + 'px', top: -(G.pad + G.bt) + 'px',
+      width: this.cssW + 'px', height: this.cssH + 'px',
+    });
   }
 
   ensureGeom() {
@@ -1459,7 +1389,7 @@ class Glass {
     ctx.putImageData(img, 0, 0);
     this.haloCanvas = c;
     this.haloUrl = c.toDataURL();
-    this.haloVer++;   // the renderer uploads it on its next draw (Renderer.haloFor)
+    if (this.M.renderer) this.haloTex = this.M.renderer.haloTexture(c, this.haloTex);
   }
 
   // While this glass hosts a backplate, its CSS background colour is painted under the plate and would be
@@ -1491,7 +1421,6 @@ class Glass {
     this.dirty = true;
     const eng = this.M.engine;
     this.backdropOn = !this.plate && this.snapFused <= 1;   // fused: the backplate (native) or the canvas shows the page
-    if (eng !== 'snapshot') this.dropGL();
     if (eng === 'native') this.buildNative();
     else {
       this.removeFilter();
@@ -1615,25 +1544,10 @@ class Glass {
     if (!this.bgHold && cs.backgroundColor !== this.bgColor) { this.bgColor = cs.backgroundColor; this.tint.set(parseColor(this.bgColor)); }
     this.rect = r;
     this.layer = (cs.position === 'fixed' ? 'f' : 'n') + '|' + cs.zIndex;
-    if (this.ky < 0) { this.kx = this.ky = cs.position === 'fixed' ? 1 : 0; this.lastCX = cx; this.lastCY = cy; }
     if (this.p.adaptive) this.luminance = this.M.luminanceAt(cx, cy, this.geom.hw * 0.8, this.geom.hh * 0.8);
     const pad = this.geom.pad;
     this.visible = !(r.right < -pad || r.bottom < -pad || r.left > global.innerWidth + pad || r.top > global.innerHeight + pad);
     return true;
-  }
-
-  // Scroll prediction (snapshot engine). Glass that stays put on screen while the page scrolls (fixed, or sticky
-  // while stuck) shows content that the compositor has already scrolled further by the time this frame is on
-  // screen; glass that scrolls with the page carries its canvas along and needs nothing. k says which it is
-  // (measured: 1 + how far the glass moved on screen / how far the page scrolled), lx / ly is the lead in px.
-  trackScroll(dx, dy, vx, vy) {
-    if (this.ky < 0 || !this.rect) return;   // not measured yet
-    const f = this.frame;
-    if (Math.abs(dx) > 0.5) this.kx = clamp(1 + (f.cx - this.lastCX) / dx, 0, 1);
-    if (Math.abs(dy) > 0.5) this.ky = clamp(1 + (f.cy - this.lastCY) / dy, 0, 1);
-    this.lastCX = f.cx; this.lastCY = f.cy;
-    f.lx = clamp(this.kx * vx, -400, 400);
-    f.ly = clamp(this.ky * vy, -400, 400);
   }
 
   // gap between the two boxes (ignores the corner radius, so it errs on the near side)
@@ -1647,25 +1561,23 @@ class Glass {
   // pass 3: draw if anything that affects the pixels changed
   render(snap) {
     if (!this.geom || !this.visible) return false;
-    const eng = this.M.engine;
-    if (eng === 'css' || !this.M.renderer) return false;            // static CPU overlay
+    const eng = this.M.engine, R = this.M.renderer;
+    if (eng === 'css' || !R) return false;            // static CPU overlay
     // only the snapshot engine samples the page; fused glass in the native engine is refracted live by the
     // shared backplate, the canvas adds light, shadow and the bridges' background colour
-    const useSnap = eng === 'snapshot' && !!(snap && snap.tex);
+    const useSnap = eng === 'snapshot' && !!(snap && snap.uploaded);
     if (eng === 'snapshot' && !useSnap) return false;
-    if (this.glLost) { this.glLost = false; this.noOwnGL = true; this.dropGL(); }
-    const R = this.R || (this.M.contextLost ? null : this.M.renderer);
-    if (!R) return false;   // the shared context is lost for now (it comes back by itself)
     const f = this.frame;
-    // in page coordinates: what the glass shows depends only on where it is on the page, so glass that scrolls
-    // along with the page does not redraw while it scrolls
-    const sx = global.scrollX, sy = global.scrollY;
-    const rk = (o) => [o.rect.left + sx, o.rect.top + sy, o.rect.width, o.rect.height].map((v) => v.toFixed(1)).join(',') + o.bgColor;
+    // What the glass shows depends on where it is on the page, not on the screen: glass that scrolls along with the
+    // page does not redraw while the page scrolls. Fused neighbours count relative to this glass (the native engine
+    // does not sample the page, so fused glass fixed on screen does not redraw either)
+    const sx = global.scrollX, sy = global.scrollY, me = this.rect;
+    const rk = (o, x, y) => [o.rect.left - x, o.rect.top - y, o.rect.width, o.rect.height].map((v) => v.toFixed(1)).join(',') + o.bgColor;
     const key = [eng, this.press.toFixed(3), this.bgColor, this.bgHold ? 'h' : '', this.snapFused,
-      useSnap ? [(f.cx + sx + f.lx).toFixed(2), (f.cy + sy + f.ly).toFixed(2), snap.version].join(',') : '',
+      useSnap ? [(f.cx + sx).toFixed(2), (f.cy + sy).toFixed(2), snap.version].join(',') : '',
       useSnap ? f.A.map((v) => v.toFixed(4)).join(',') : '',
-      this.fuse.length ? rk(this) + ':' + this.fuse.map(rk).join(';') : '',
-      useSnap ? this.others.map((o) => rk(o) + o.frame.lx.toFixed(1) + ',' + o.frame.ly.toFixed(1)).join(';') : ''].join('|');
+      this.fuse.length ? rk(this, me.left, me.top) + ':' + this.fuse.map((o) => rk(o, me.left, me.top)).join(';') : '',
+      useSnap ? this.others.map((o) => rk(o, -sx, -sy)).join(';') : ''].join('|');
     if (!this.dirty && key === this.key) return false;
     this.key = key;
     this.dirty = false;
@@ -1701,7 +1613,6 @@ class Glass {
     if (this.dragH) { for (const k in this.dragH) this.el.removeEventListener(k, this.dragH[k], k === 'click'); this.dragH = null; }
     this.ro.disconnect();
     this.removeFilter();
-    this.dropGL();
     this.canvas.remove();
     this.el.removeAttribute('data-lg-glass');
     Object.assign(this.el.style, this.saved);
@@ -1967,7 +1878,7 @@ class Manager {
     this.stats = {
       engine: '', glasses: 0, captures: 0, lastCaptureMs: 0, captureOnlyMs: 0, uploadMs: 0, renderMs: 0,
       snapW: 0, snapH: 0, scale: 0, live: 0, holes: 0, error: '', parts: null, plates: 0, plateBuilds: 0, plateMs: 0, rafMs: 0, inputFrames: 0,
-      scrollLead: 0, scrollV: 0,
+      scrollSync: false,
     };
     this.plates = new Map();   // lowest glass of a fused group -> its shared backplate
   }
@@ -1979,13 +1890,10 @@ class Manager {
     this.renderer = null;
     try { this.renderer = new Renderer(); } catch (err) { this.glError = String(err.message || err); }
     if (this.renderer) this.watchContext(this.renderer.canvas);
-    // Outside Chromium every glass draws into a WebGL canvas of its own. Copying out of one shared WebGL canvas
-    // into each glass's 2D canvas reads the pixels back from the GPU there (WebKit: ~15 ms per glass), and while
-    // the page scrolls every glass that stays on screen redraws every frame. Chromium copies on the GPU.
-    this.ownGL = !IS_CHROMIUM; this.ownCount = 0;
     this.capturer = new Capturer(this);
     this.snap = null; this.snapVersion = 0;
     this.lum = null;
+    this.liveAt = new WeakMap();
     this.scratch = document.createElement('canvas');
     this.engine = this.resolve(this.cfg.engine);
     this.stats.engine = this.engine;
@@ -1993,7 +1901,6 @@ class Manager {
     this.tick = this.tick.bind(this);
     this.lastTick = performance.now();
     this.pumped = false; this.pumpT = 0; this.pumpWall = 0; this.rafDt = 0; this.lastRafT = 0;
-    this.sX = global.scrollX; this.sY = global.scrollY; this.sT = 0; this.svx = 0; this.svy = 0; this.sMoved = 0;
     this.hookRaf();
     this.rafId = this.raf(this.tick);
     this.watchThrottle();
@@ -2005,7 +1912,8 @@ class Manager {
     canvas.addEventListener('webglcontextrestored', () => {
       this.contextLost = false;
       try { this.renderer = new Renderer(canvas); } catch (err) { this.renderer = null; this.engine = this.resolve(this.cfg.engine); return; }
-      for (const g of this.glasses) { g.dirty = true; g.key = ''; }   // the new renderer uploads snapshot and halos as it draws
+      if (this.snap) this.snap.uploaded = false;
+      for (const g of this.glasses) { g.haloTex = null; g.buildHalo(); g.dirty = true; g.key = ''; }
       this.refresh();
     });
   }
@@ -2041,10 +1949,35 @@ class Manager {
 
   refresh() { if (!this.started) return; this.capturer.next = 0; this.capturer.request(); }
 
-  scrolling(now) { return (now || performance.now()) - this.scrollAt < 250; }
-  // resolves once the page has stopped scrolling
-  still() {
-    return new Promise((res) => { const f = () => { if (this.scrolling()) setTimeout(f, 100); else res(); }; f(); });
+  pageScrolling(now) { return (now || performance.now()) - this.pageScrollAt < 250; }
+  // resolves once the page has stopped scrolling (or after 10 s)
+  pageStill() {
+    const t0 = performance.now();
+    return new Promise((res) => {
+      const f = () => { const now = performance.now(); if (this.pageScrolling(now) && now - t0 < 10000) setTimeout(f, 100); else res(); };
+      f();
+    });
+  }
+
+  // While Safari's toolbar resizes along with a scroll (most visibly scrolling up), WebKit tells the page its new
+  // scroll position only every 100 ms, to save power (WKWebView _updateVisibleContentRects): the page itself scrolls
+  // smoothly, but the rim, which is drawn from scrollY, would move ten times a second and look stuck. WebKit keeps
+  // sending every frame while the page has a scroll-driven animation that runs on the main thread
+  // (hasMainThreadScrollDrivenAnimations), so the snapshot engine keeps one going: an invisible 1 px element whose
+  // custom property follows the page's scroll (custom properties are never animated off the main thread).
+  scrollProbe(on) {
+    if (this.probe && !this.probe.isConnected) { this.probe = null; this.stats.scrollSync = false; }   // the page removed it
+    if (on === !!this.probe) return;
+    if (!on) { this.probe.remove(); this.probe = null; this.stats.scrollSync = false; return; }
+    const el = this.probe = document.createElement('div');
+    el.setAttribute('data-lg-ignore', '');
+    el.setAttribute('aria-hidden', 'true');
+    el.style.cssText = 'all:initial;display:block;position:fixed;left:0;top:0;width:1px;height:1px;visibility:hidden;pointer-events:none;contain:strict;';
+    document.documentElement.appendChild(el);
+    try {
+      el.animate({ '--lg-scroll': ['0', '1'] }, { timeline: new global.ScrollTimeline({ source: document.scrollingElement || document.documentElement }), fill: 'both' });
+      this.stats.scrollSync = true;
+    } catch (err) { /* nothing to keep it going with */ }
   }
 
   create(el, opts) {
@@ -2180,7 +2113,11 @@ class Manager {
   onSnapshot(snap) {
     snap.version = ++this.snapVersion;
     this.snap = snap;
-    snap.tex = this.needsTexture();   // each renderer uploads it when it next draws (Renderer.sync)
+    if (this.needsTexture()) {
+      this.renderer.setSnapshot(snap.canvas);
+      snap.uploaded = true;
+      this.liveAt = new WeakMap();
+    }
     this.stats.snapW = snap.w; this.stats.snapH = snap.h; this.stats.scale = snap.scale;
     // coarse luminance grid, in document coordinates
     let c = snap.canvas.lumCanvas;
@@ -2239,9 +2176,13 @@ class Manager {
       if (d !== this.dpr) { this.dpr = d; for (const g of this.glasses) g.geom = null; req(); }
       if (global.innerWidth !== vpW) { vpW = global.innerWidth; req(); }
     });
-    // scrolling needs no new snapshot; captures wait until it stops (see Capturer)
-    this.scrollAt = -1e9;
-    global.addEventListener('scroll', () => { this.scrollAt = performance.now(); }, { capture: true, passive: true });
+    // scrolling needs no new snapshot; captures wait until it stops (see Capturer). The page's own scrolling fires
+    // at the document, scrolling inside it at the element
+    this.scrollAt = this.pageScrollAt = -1e9;
+    global.addEventListener('scroll', (e) => {
+      this.scrollAt = performance.now();
+      if (e.target === document) this.pageScrollAt = this.scrollAt;
+    }, { capture: true, passive: true });
     if (document.fonts) {
       document.fonts.ready.then(req);
       if (document.fonts.addEventListener) document.fonts.addEventListener('loadingdone', req);
@@ -2264,8 +2205,8 @@ class Manager {
 
   // canvas / video marked data-lg-live go straight into the texture, only while a glass is over them
   patchLive(now) {
-    const snap = this.snap;
-    if (!this.renderer || !snap || !snap.tex || !this.needsTexture()) return 0;
+    const R = this.renderer, snap = this.snap;
+    if (!R || !snap || !snap.uploaded || !this.needsTexture()) return 0;
     let n = 0;
     const minDt = 1000 / this.cfg.liveFps;
     for (const el of document.querySelectorAll('[data-lg-live]')) {
@@ -2273,15 +2214,9 @@ class Manager {
       if (!r.width || !r.height) continue;
       const over = this.glasses.filter((g) => g.visible && g.overlaps(r));
       if (!over.length) continue;
-      // every snapshot texture it shows in (the shared renderer's, and those of glass with a canvas of its own)
-      // that has not had it for 1 / liveFps
-      const due = [];
-      for (const g of over) {
-        const R = g.R || this.renderer;
-        const last = R.snapV === snap.version ? R.liveAt.get(el) || 0 : -1e9;
-        if (due.indexOf(R) < 0 && now - last >= minDt) due.push(R);
-      }
-      if (!due.length) { n++; continue; }
+      const last = this.liveAt.get(el) || 0;
+      if (now - last < minDt) { n++; continue; }
+      this.liveAt.set(el, now);
       const x0 = Math.round((r.left + global.scrollX - snap.ox) * snap.scale);
       const y0 = Math.round((r.top + global.scrollY - snap.oy) * snap.scale);
       const w = Math.round(r.width * snap.scale), h = Math.round(r.height * snap.scale);
@@ -2294,8 +2229,8 @@ class Manager {
       const iw = el.width || el.videoWidth || r.width, ih = el.height || el.videoHeight || r.height;
       try {
         ctx.drawImage(el, (cx0 - x0) / w * iw, (cy0 - y0) / h * ih, sc.width / w * iw, sc.height / h * ih, 0, 0, sc.width, sc.height);
-        for (const R of due) { R.sync(snap); R.patch(cx0, cy0, sc); R.liveAt.set(el, now); }
-        for (const g of over) if (due.indexOf(g.R || this.renderer) >= 0) g.dirty = true;   // only glass over this layer redraws
+        R.patch(cx0, cy0, sc);
+        for (const g of over) g.dirty = true;   // only glass over this layer has to redraw
         n++;
       } catch (err) { /* cross-origin media cannot be read */ }
     }
@@ -2400,26 +2335,6 @@ class Manager {
     this.frame(now);
   }
 
-  // page scroll velocity (px/ms), smoothed; it drops to 0 once the page has not moved for 50 ms
-  trackScroll(now) {
-    const sx = global.scrollX, sy = global.scrollY, dt = now - this.sT;
-    if (!(dt > 0)) return;   // the same rendering update again (rerun)
-    const dx = sx - this.sX, dy = sy - this.sY;
-    if (dx || dy) {
-      const a = this.sT && dt < 100 ? 0.5 : 1;
-      this.svx += (dx / dt - this.svx) * a; this.svy += (dy / dt - this.svy) * a;
-      this.sMoved = now;
-    } else if (now - this.sMoved > 50) { this.svx = 0; this.svy = 0; }
-    this.sX = sx; this.sY = sy; this.sT = now;
-    let lead = this.cfg.scrollLead;
-    if (lead === 'auto') lead = IS_IOS ? 32 : 16;
-    lead = Math.max(0, +lead || 0);
-    this.stats.scrollLead = lead;
-    if (this.engine !== 'snapshot') lead = 0;   // the native engine refracts the live page, nothing to predict
-    this.stats.scrollV = Math.round(Math.hypot(this.svx, this.svy) * 1000);
-    for (const g of this.glasses) g.trackScroll(dx, dy, this.svx * lead, this.svy * lead);
-  }
-
   frame(now) {
     const dt = Math.min(0.05, Math.max(0, (now - this.lastTick) / 1000));
     this.lastTick = now;
@@ -2428,12 +2343,13 @@ class Manager {
     // pass 1: positions and layers
     for (const g of this.glasses) g.stepPress(dt);
     for (const g of this.glasses) { g.measureFrame(); g.stepLight(dt); }
-    this.trackScroll(now);
+    // only the snapshot engine draws from scrollY, and only WebKit holds scroll positions back
+    this.scrollProbe(HAS_SCROLL_TIMELINE && !IS_CHROMIUM && this.engine === 'snapshot' && this.glasses.length > 0);
     for (const pl of this.plates.values()) pl.measure();
     // pass 2: who fuses with whom (same layer, closer than blend), who just overlaps (a hole). Fusing needs
     // the WebGL highlights; in the snapshot engine also the snapshot the rim is refracted from
     const canFuse = !!this.renderer && !this.contextLost &&
-      (this.engine === 'native' || (this.engine === 'snapshot' && !!(this.snap && this.snap.tex)));
+      (this.engine === 'native' || (this.engine === 'snapshot' && !!(this.snap && this.snap.uploaded)));
     const cand = new Map();
     for (const g of this.glasses) {
       g.fuse = []; g.others = [];
@@ -2457,22 +2373,13 @@ class Manager {
       }
     }
     this.updatePlates();
-    // one glass a frame gets its own WebGL canvas, never while the page scrolls (a new context compiles the
-    // shader, which would hold up the scroll); until then it draws through the shared one. Glass that redraws
-    // while the page scrolls (fixed, or stuck sticky) comes first, then the rest on screen
-    if (this.ownGL && this.engine === 'snapshot' && this.ownCount < MAX_OWN_GL && !this.scrolling()) {
-      const want = (g) => !g.R && !g.noOwnGL && g.geom;
-      const g = this.glasses.find((x) => x.visible && (x.kx > 0 || x.ky > 0) && want(x)) ||
-        this.glasses.find((x) => x.visible && want(x)) || this.glasses.find(want);
-      if (g) g.attachGL();
-    }
     const live = this.patchLive(now);
     // pass 3: draw what changed
     let drew = 0;
-    for (const g of this.glasses) if (g.render(this.snap)) drew++;
+    if (!this.contextLost) for (const g of this.glasses) if (g.render(this.snap)) drew++;
     if (drew) {
       let w = 0, h = 0;
-      for (const g of this.glasses) if (g.visible && !g.R) { w = Math.max(w, g.pxW); h = Math.max(h, g.pxH); }
+      for (const g of this.glasses) if (g.visible) { w = Math.max(w, g.canvas.width); h = Math.max(h, g.canvas.height); }
       this.renderer.endFrame(w, h, now);
     }
     const cost = performance.now() - t0;

@@ -367,12 +367,12 @@ p code, li code, td code { background: #e8eaef; padding: 1px 6px; border-radius:
         <tbody>
           <tr><td>内置截图：克隆 DOM，页面样式表原样交给浏览器画，不逐个读样式</td><td>这张页面约 80–120 毫秒，modern-screenshot 要 1.3–1.6 秒（无 GPU 的测试机）</td></tr>
           <tr><td>整页只拍一次，拖动和滚动只移动采样位置</td><td>拖动不触发截图</td></tr>
-          <tr><td>只在内容变化时重拍；间隔 ≥ 250 毫秒且 ≥ 上次耗时的 4 倍，并放到浏览器空闲时执行；页面滚动时一律等滚动停下再拍</td><td>截图最多占约 20% 主线程，不和拖动、滚动抢帧</td></tr>
+          <tr><td>只在内容变化时重拍；间隔 ≥ 250 毫秒且 ≥ 上次耗时的 4 倍，并放到浏览器空闲时执行；页面滚动时等滚动停下再拍</td><td>截图最多占约 20% 主线程，不和拖动、滚动抢帧</td></tr>
           <tr><td>纹理不生成 mipmap；亮度用 64 像素宽的小图算，不回读大图</td><td>上传约 5 毫秒</td></tr>
           <tr><td>中间平坦区域交给 CSS 模糊，WebGL 只算边缘一圈</td><td>着色器的重活只在几个像素宽的环上</td></tr>
           <tr><td>实时图层只在玻璃经过时上传自己那一小块</td><td>不重拍整页</td></tr>
-          <tr><td>屏幕外的玻璃不绘制；跟着页面滚的玻璃滚动时不重绘；大面板的投影范围有上限</td><td>面板再多、再大，开销也基本只和屏幕上的玻璃有关</td></tr>
-          <tr><td>Safari / Firefox 里每块玻璃直接画在自己的 WebGL 画布上（最多 12 块，其余共用一个），Chrome 里共用一个</td><td>不再把像素从 GPU 读回来再拷进 2D 画布；无 GPU 的 WebKit 测试机上滚动时每帧从约 28 毫秒降到约 5 毫秒</td></tr>
+          <tr><td>屏幕外的玻璃不绘制；跟着页面滚的玻璃滚动时不重绘；所有玻璃共用一个 WebGL 上下文；大面板的投影范围有上限</td><td>面板再多、再大，开销也基本只和屏幕上的玻璃有关</td></tr>
+          <tr><td>iOS Safari 地址栏跟着滚动收起、展开时，WebKit 只每 100 毫秒告诉页面一次滚动位置；SDK 放一个跟着滚动的 CSS 动画，让它照常每帧都告诉</td><td>向上滚动时边缘不再卡住</td></tr>
           <tr><td>融合直接过滤实时页面，不截图；原生引擎的背板位移图只在玻璃相对位置变化时重建，按 1 个 CSS 像素一格生成，跳过离轮廓远的区域</td><td>拖着融合中的玻璃时每帧约几毫秒，静止或整组移动时为零</td></tr>
           <tr><td>每帧的测量和绘制排在页面自己的动画回调之后；拖动时指针柔光固定在手指下</td><td>页面在动画循环里移动的玻璃当帧就画在新位置，不慢一帧；拖动中玻璃不用每帧重画</td></tr>
         </tbody>
@@ -492,8 +492,6 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
         <button type="button" data-v="0.5" aria-pressed="true">½</button>
         <button type="button" data-v="0.25" aria-pressed="false">¼</button>
       </div>
-      <div class="row"><label for="p-lead">滚动预测</label><input type="range" id="p-lead" min="0" max="80" step="1" value="32"><output id="o-lead" for="p-lead">自动</output></div>
-      <p class="note">滚动是浏览器在另一个线程里做的，边缘那圈却要等 JS 画完才更新，所以会慢几帧。这里按滚动速度往前多取几毫秒的位置：边缘跟不上就调大，跑到内容前面就调小。只对快照引擎有用。</p>
     </div>
 
     <div class="grp">
@@ -534,7 +532,7 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
         <dt>每帧绘制</dt><dd id="s-render">—</dd>
         <dt>实时图层</dt><dd id="s-live">—</dd>
         <dt>动画帧率</dt><dd id="s-fps">—</dd>
-        <dt>滚动速度</dt><dd id="s-scroll">—</dd>
+        <dt>滚动位置</dt><dd id="s-scroll">—</dd>
       </dl>
       <p class="note" id="s-error" hidden></p>
     </div>
@@ -748,7 +746,26 @@ let last = performance.now();
 let warm = 0;
 const startWarmUp = () => { if (!st.drag) warm = 6; };
 window.addEventListener('load', () => (window.requestIdleCallback ? requestIdleCallback(startWarmUp, { timeout: 1500 }) : setTimeout(startWarmUp, 300)));
+// How often the page learns a new scroll position while it scrolls, against the frame rate: Safari can hold it
+// back to 10 a second while its toolbar resizes, which the SDK's scroll sync (LiquidGlass.stats.scrollSync) stops
+const scrollRate = { y: window.scrollY, t0: 0, last: 0, moves: 0, frames: 0, text: '还没滚动' };
+function measureScroll(now) {
+  const S = scrollRate, y = window.scrollY;
+  if (y !== S.y) {
+    if (!S.t0) { S.t0 = now; S.moves = 0; S.frames = 0; }
+    S.moves++; S.last = now; S.y = y;
+  }
+  if (!S.t0) return;
+  S.frames++;
+  if (now - S.last < 300) return;
+  // the scroll is over: how many new positions per second, how many frames
+  const sec = (S.last - S.t0) / 1000;
+  if (sec > 0.2) S.text = `上次滚动每秒 ${Math.round(S.moves / sec)} 次，${Math.round(S.frames / ((now - S.t0) / 1000))} 帧`;
+  S.t0 = 0;
+}
+
 function frame(now) {
+  measureScroll(now);
   const dt = clamp((now - last) / 1000, 1 / 240, 1 / 30);
   last = now;
   // under the finger the orb sits exactly where the pointer is (the stretch below carries the motion);
@@ -965,16 +982,6 @@ $('#seg-cap').addEventListener('click', (e) => {
   setSeg($('#seg-cap'), b.dataset.v);
   LiquidGlass.config({ capturer: b.dataset.v });
 });
-// scroll prediction: 'auto' until the slider is touched
-const leadIn = $('#p-lead');
-let leadAuto = true;
-paintRange(leadIn);
-leadIn.addEventListener('input', () => {
-  leadAuto = false;
-  LiquidGlass.config({ scrollLead: Number(leadIn.value) });
-  $('#o-lead').textContent = leadIn.value + 'ms';
-  paintRange(leadIn);
-});
 $('#seg-scale').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   setSeg($('#seg-scale'), b.dataset.v);
@@ -991,8 +998,7 @@ $('#p-reset').addEventListener('click', () => {
   Object.assign(P, DEF); syncRows(); setGlow(); applyGlassNow();
   setContrast('off'); setEngine('auto');
   setSeg($('#seg-scale'), '0.5'); setSeg($('#seg-cap'), 'fast');
-  LiquidGlass.config({ captureScale: 0.5, capturer: 'fast', scrollLead: 'auto' });
-  leadAuto = true; $('#o-lead').textContent = '自动';
+  LiquidGlass.config({ captureScale: 0.5, capturer: 'fast' });
   setProgress(0.62); phase = 'run'; setPlaying(!reduceMotion); placeInitial();
 });
 function setPanel(open) {
@@ -1028,10 +1034,9 @@ setInterval(() => {
   $('#s-holes').textContent = s.engine === 'snapshot' ? String(s.holes) : '—';
   $('#s-render').textContent = s.engine === 'snapshot' ? s.renderMs.toFixed(2) + ' ms' : s.engine === 'native' ? '只在高光变化时' : '静态';
   $('#s-live').textContent = s.engine === 'snapshot' ? String(s.live) : '—';
+  $('#s-scroll').textContent = (s.scrollSync ? '同步已开启' : '同步未开启') + ' · ' + scrollRate.text;
   // Safari / iOS halve requestAnimationFrame in a cross-origin frame until the first tap; the SDK then draws
   // from pointer input instead (counted here)
-  $('#s-scroll').textContent = `${s.scrollV} px/s · 预测 ` + (LiquidGlass.engine === 'snapshot' ? s.scrollLead + ' ms' : '不需要');
-  if (leadAuto) { leadIn.value = s.scrollLead; paintRange(leadIn); }
   $('#s-fps').textContent = s.rafMs ? `${Math.round(1000 / s.rafMs)} fps` + (s.inputFrames ? ` · 输入补帧 ${s.inputFrames}` : '') : '—';
   const err = $('#s-error');
   err.hidden = !s.error;
