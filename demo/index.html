@@ -157,7 +157,8 @@ p code, li code, td code { background: #e8eaef; padding: 1px 6px; border-radius:
 }
 .orb.grabbing { cursor: grabbing; }
 .orb:focus-visible::after { content: ""; position: absolute; inset: -7px; border-radius: 50%; border: 2px solid var(--accent); }
-.orb svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; color: var(--white); transition: color 0.35s ease; }
+/* the ring and icon keep their size (--g) when the orb itself (--d) is smaller */
+.orb svg { position: absolute; left: 50%; top: 50%; width: var(--g, 176px); height: var(--g, 176px); margin: calc(var(--g, 176px) / -2) 0 0 calc(var(--g, 176px) / -2); overflow: visible; pointer-events: none; color: var(--white); transition: color 0.35s ease; }
 .orb svg.dark { color: var(--glyph-dark); }
 .orb .track { fill: none; stroke: currentColor; stroke-opacity: 0.3; stroke-width: 3; }
 .orb .arc { fill: none; stroke: currentColor; stroke-width: 3; stroke-linecap: round; }
@@ -630,8 +631,10 @@ const orb = $('#orb');
 const ringSvg = $('#ring');
 const DEF = { dim: 15, bezel: 6, refract: 30, disp: 13, frost: 0, spec: 100, glow: 100 };
 const P = { ...DEF };
-const D = vw < 640 ? 132 : 176;
+const D = vw < 640 ? 108 : 144;   // the glass orb
+const G = vw < 640 ? 132 : 176;   // the ring and icon are drawn in a G-sized box around its centre
 document.documentElement.style.setProperty('--d', D + 'px');
+document.documentElement.style.setProperty('--g', G + 'px');
 
 let playing = !reduceMotion;
 let progress = 0.62, phase = 'run', hold = 0;
@@ -639,20 +642,24 @@ let contrastMode = 'off';
 let glyphDark = false;
 
 function orbMask(ctx, w) {
-  const u = w / 100;
-  ctx.lineWidth = 3 * u;
-  ctx.beginPath(); ctx.arc(50 * u, 50 * u, 21 * u, 0, Math.PI * 2); ctx.stroke();
+  // same 100-unit drawing as the svg, scaled to G and centred on the (smaller) orb
+  const u = w / D * G / 100, o = w / 2 - 50 * u;
+  ctx.save();
+  ctx.translate(o, o); ctx.scale(u, u);
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(50, 50, 21, 0, Math.PI * 2); ctx.stroke();
   if (playing) {
     for (const x of [44.2, 51.7]) {
       ctx.beginPath();
-      if (ctx.roundRect) ctx.roundRect(x * u, 43 * u, 4.1 * u, 14 * u, 1.4 * u); else ctx.rect(x * u, 43 * u, 4.1 * u, 14 * u);
+      if (ctx.roundRect) ctx.roundRect(x, 43, 4.1, 14, 1.4); else ctx.rect(x, 43, 4.1, 14);
       ctx.fill();
     }
   } else {
-    ctx.lineJoin = 'round'; ctx.lineWidth = 2.2 * u;
-    ctx.beginPath(); ctx.moveTo(46.6 * u, 43.6 * u); ctx.lineTo(46.6 * u, 56.4 * u); ctx.lineTo(57 * u, 50 * u); ctx.closePath();
+    ctx.lineJoin = 'round'; ctx.lineWidth = 2.2;
+    ctx.beginPath(); ctx.moveTo(46.6, 43.6); ctx.lineTo(46.6, 56.4); ctx.lineTo(57, 50); ctx.closePath();
     ctx.fill(); ctx.stroke();
   }
+  ctx.restore();
 }
 function glassOpts() {
   return { dim: P.dim / 100, bezel: P.bezel / 100, refract: P.refract / 100, disp: P.disp / 100, frost: P.frost, spec: P.spec / 100 };
@@ -887,6 +894,8 @@ document.querySelector('.spawn').addEventListener('click', (e) => {
   if (b) spawn(b.dataset.kind);
 });
 $('#p-clear').addEventListener('click', () => document.querySelectorAll('.spawned').forEach((el) => el.remove()));
+// a few panels are there from the start, so there is something to drag and merge right away
+['card', 'pill', 'round'].forEach(spawn);
 
 // ------------------------------------------------------------ control sheet
 const ROWS = [
