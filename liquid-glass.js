@@ -81,6 +81,8 @@ const DEFAULTS = {
   glyphDark: 0,     // 0..1，图形是深色时 halo 改为提亮
   adaptive: false,  // 维护 glass.luminance（玻璃下方页面的平均亮度，线性 0..1）
 };
+// fused in the snapshot engine with at least this much frost, the merged shape is painted from the snapshot
+const SNAP_FILL_FROST = 2;
 const OPTICAL = ['dim', 'bezel', 'refract', 'curve', 'disp', 'frost', 'sat', 'tint', 'spec', 'shadow', 'ior', 'gap'];
 const CONFIG = {
   engine: 'auto',           // 'auto' | 'native' | 'snapshot' | 'css'
@@ -90,8 +92,12 @@ const CONFIG = {
   capturer: 'fast',         // 'fast'（内置）| 'modern-screenshot'（需要全局 modernScreenshot）
   embedFonts: false,
   liveFps: 30,
+  // 快照引擎：滚动由浏览器的合成线程完成，玻璃边缘却是主线程按 scrollY 画的，画面送到屏幕时页面已经又滚了一段。
+  // 按滚动速度往前多取这么多毫秒的位置，边缘就跟得上滚动。'auto'：iOS / iPadOS 32，其他 16；0 关闭
+  scrollLead: 'auto',
   auto: true,               // 自动接管 [data-liquid-glass]
 };
+const IS_IOS = /iP(hone|od|ad)/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1);
 
 function isSandbox(node) {
   return node && node.nodeType === 1 && node.tagName === 'IFRAME' && /^__SANDBOX__/.test(node.id || '');
@@ -103,6 +109,8 @@ function isIgnored(node) {
 }
 function mutationMatters(r) {
   if (isIgnored(r.target)) return false;
+  // writing an attribute's current value again (a canvas resized to the size it has) changes nothing
+  if (r.type === 'attributes' && r.oldValue === r.target.getAttribute(r.attributeName)) return false;
   if (r.type === 'childList') {
     const nodes = [...r.addedNodes, ...r.removedNodes];
     if (nodes.length && nodes.every((n) => isIgnored(n))) return false;
@@ -217,6 +225,7 @@ uniform vec4 uFuseOpt2[8];   // that neighbour's shadow, ior, gap
 uniform int uFuseN;
 uniform vec4 uTintSelf;      // this glass's CSS background colour
 uniform float uOwnTint;      // 1 while this glass hosts the backplate: its CSS background is off, painted here
+uniform float uSnapFill;     // fused in the snapshot engine: 1 dimming and bridges painted here, 2 all of it
 uniform float uBlend, uPress;
 out vec4 o;
 
@@ -307,10 +316,12 @@ void main() {
   vec4 tintE = uTintSelf;
   vec4 opt = vec4(uBezel, uThick, uK, uSpec);   // optics, blended across bridges while fused
   vec4 opt2 = vec4(uShadow, uIor, uGap, 0.0);
+  float upClaim = 0.0;         // how much a fused glass painted above this one draws here (any share at all)
   if (uFuseN > 0) {
     // who draws this pixel: own interior is ours; an overlap belongs to the glass painted lowest, so the
     // highlights sit under the content of every glass in the stack; outside every box, the nearest glass
-    // draws the bridge. The page behind the merged shape comes from the shared backplate element.
+    // draws the bridge. The page behind the merged shape comes from the shared backplate element (native engine),
+    // or from each glass's own backdrop plus what uSnapFill paints below (snapshot engine).
     // The share is soft (a 2 css px ramp) and the shares of neighbouring canvases add up to 1: each canvas has
     // its own pixel grid, so a hard yes/no would leave a seam of double (or no) highlight and shadow
     float wIn = 1.0, wOut = 1.0;
@@ -321,12 +332,14 @@ void main() {
       float sj = rrSd(p - uFuse[i].xy, uFuse[i].zw, uFuseR[i], nj);
       float outJ = clamp(0.5 + sj * 0.5, 0.0, 1.0);
       if (uFuseTop[i] < 0.5) wIn *= outJ;                         // inside a glass painted lower: that one draws
+      else upClaim = max(upClaim, max(clamp(1.5 - sj * 0.5, 0.0, 1.0), clamp(1.5 + (sdSelf - sj) * 0.5, 0.0, 1.0)));
       wOut *= outJ * clamp(0.5 + (sj - sdSelf) * 0.5, 0.0, 1.0);    // outside every box: the nearest draws
       uncovered *= clamp(0.5 + sj * uDpr, 0.0, 1.0);
     }
     float inSelf = clamp(0.5 - sdSelf * 0.5, 0.0, 1.0);
     share = inSelf * wIn + (1.0 - inSelf) * wOut;
-    if (share <= 0.0) { o = vec4(0.0); return; }
+    // (a glass above may still need this one's opaque part under it, see wMat below)
+    if (share <= 0.0 && upClaim * (uSnapFill > 1.5 ? 1.0 : uSnapFill > 0.5 ? uncovered : 0.0) <= 0.0) { o = vec4(0.0); return; }
     sd = unionSd(p, sdSelf, outward, mE, tintE, opt, opt2);
     bridge = uncovered;
   }
@@ -416,19 +429,44 @@ void main() {
     }
   }
   float hiT = 1.0 - (1.0 - hi) * (1.0 - kl);
-  vec4 over = vec4(vec3(hiT), 1.0 - (1.0 - kd) * (1.0 - hiT));   // premultiplied, over the live page
+  // premultiplied, over the live page: the light (hiT) on top of the material, which is the darkening, the CSS
+  // background colour, what uSnapFill paints and the refracting rim
+  vec4 mat = vec4(0.0, 0.0, 0.0, kd);
   // a bridge has no element under it to carry the CSS background colour, so it is painted here (and so is
   // this glass's own background while it hosts the backplate, which would otherwise filter it)
   vec4 tintP = vec4(tintE.rgb * tintE.a, tintE.a) * bridge + vec4(uTintSelf.rgb * uTintSelf.a, uTintSelf.a) * ownCov * uOwnTint;
-  over += tintP * (1.0 - over.a);
-  vec4 lens = mix(over, vec4(mix(col * (1.0 - kd), vec3(1.0), hiT), 1.0), rim);
-  o = (lens * aa + vec4(0.0, 0.0, 0.0, sh) * (1.0 - aa)) * share;
+  mat += tintP * (1.0 - mat.a);
+  float wMat = share;
+  // fused in the snapshot engine there is no backplate: only a border-radius shape clips a backdrop-filter
+  // reliably (WebKit leaks a clip-path'd backdrop over its whole box, Chrome ignores the clip-path).
+  // 1 (little or no frost): each glass keeps its own live backdrop without the dimming, which is painted here
+  //   once per pixel of the merged shape; a bridge has no backdrop under it, so the page there is the snapshot.
+  // 2 (frost): stacked blurring backdrops would blur an overlap twice and show the lower glass's edge, so the
+  //   backdrops are off and the whole merged shape is painted from the (blurred) snapshot, once per pixel.
+  if (uSnapFill > 0.5) {
+    vec4 base = vec4(0.0, 0.0, 0.0, uDim);
+    float fill = uSnapFill > 1.5 ? 1.0 : bridge;
+    if (fill > 0.0) {
+      vec4 sF = bg(p, 1.0);
+      float lF = dot(sF.rgb, vec3(0.2126, 0.7152, 0.0722));
+      vec3 cF = clamp(mix(vec3(lF), sF.rgb, uSat), 0.0, 1.0) * (1.0 - uDim);
+      base = mix(base, vec4(cF, 1.0), fill * sF.a);
+    }
+    mat += base * (1.0 - mat.a);
+    // shares that add up to 1 still leave a gap when one canvas is composited over the other (s + (1 - s) s < 1),
+    // so where a glass above takes over, this one paints its opaque part fully under it (where nothing filters
+    // the page: everywhere in mode 2, the bridges in mode 1)
+    wMat = max(share, upClaim * (uSnapFill > 1.5 ? 1.0 : bridge));
+  }
+  mat = mix(mat, vec4(col * (1.0 - kd), 1.0), rim);
+  vec4 light = vec4(vec3(hiT), hiT) * share;
+  o = (light + mat * wMat * (1.0 - light.a)) * aa + vec4(0.0, 0.0, 0.0, sh) * (1.0 - aa) * share;
 }`;
 
 const UNIFORMS = ['uSnap', 'uHaloTex', 'uSnapSize', 'uCenterSnap', 'uCanvasPx', 'uHalf', 'uLight', 'uTouch', 'uShadowGeom', 'uA',
   'uSnapScale', 'uDpr', 'uRad', 'uPad', 'uBezel', 'uK', 'uThick', 'uIor', 'uGap', 'uDisp', 'uFrost', 'uSpec',
   'uTint', 'uSat', 'uDim', 'uShadow', 'uTouchAmt', 'uHalo', 'uGlyphDark', 'uNative', 'uOther', 'uOtherR', 'uOtherN',
-  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseOpt', 'uFuseOpt2', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uBlend', 'uPress'];
+  'uFuse', 'uFuseR', 'uFuseTop', 'uFuseTint', 'uFuseOpt', 'uFuseOpt2', 'uFuseN', 'uTintSelf', 'uOwnTint', 'uSnapFill', 'uBlend', 'uPress'];
 
 class Renderer {
   constructor(canvas) {
@@ -527,7 +565,7 @@ class Renderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, snap ? this.snapTex : this.blackTex);
     gl.uniform2f(U.uSnapSize, snap ? this.snapW : 1, snap ? this.snapH : 1);
-    gl.uniform2f(U.uCenterSnap, snap ? (f.cx + global.scrollX - snap.ox) * snap.scale : 0, snap ? (f.cy + global.scrollY - snap.oy) * snap.scale : 0);
+    gl.uniform2f(U.uCenterSnap, snap ? (f.cx + global.scrollX + f.lx - snap.ox) * snap.scale : 0, snap ? (f.cy + global.scrollY + f.ly - snap.oy) * snap.scale : 0);
     gl.uniform2f(U.uCanvasPx, cw, ch);
     gl.uniform2f(U.uHalf, G.hw, G.hh);
     gl.uniform2f(U.uLight, LX, LY);
@@ -559,9 +597,9 @@ class Renderer {
     const oa = this.otherBuf || (this.otherBuf = new Float32Array(32));
     const orr = this.otherRBuf || (this.otherRBuf = new Float32Array(8));
     for (let i = 0; i < others.length; i++) {
-      const r = others[i].rect, k = snap.scale;
-      oa[i * 4] = (r.left + r.width / 2 + global.scrollX - snap.ox) * k;
-      oa[i * 4 + 1] = (r.top + r.height / 2 + global.scrollY - snap.oy) * k;
+      const r = others[i].rect, of = others[i].frame, k = snap.scale;
+      oa[i * 4] = (r.left + r.width / 2 + global.scrollX + of.lx - snap.ox) * k;
+      oa[i * 4 + 1] = (r.top + r.height / 2 + global.scrollY + of.ly - snap.oy) * k;
       oa[i * 4 + 2] = r.width / 2 * k; oa[i * 4 + 3] = r.height / 2 * k;
       orr[i] = Math.min(others[i].geom.r * k, r.width / 2 * k, r.height / 2 * k);
     }
@@ -597,7 +635,10 @@ class Renderer {
     gl.uniform4fv(U.uFuseOpt2, fo2);
     gl.uniform1i(U.uFuseN, fuse.length);
     gl.uniform4fv(U.uTintSelf, g.tint);
-    gl.uniform1f(U.uOwnTint, g.bgHold ? 1 : 0);
+    const fill = snap && !native && fuse.length ? g.snapFused : 0;
+    // painting all of the merged shape covers the glass's own CSS background, so the canvas paints it on top
+    gl.uniform1f(U.uOwnTint, g.bgHold || fill === 2 ? 1 : 0);
+    gl.uniform1f(U.uSnapFill, fill);
     gl.uniform1f(U.uBlend, g.blendK());
     gl.uniform1f(U.uPress, g.press || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -841,9 +882,9 @@ class Capturer {
     const go = () => {
       this.timer = 0;
       // a capture blocks the main thread for a while (and Safari has no requestIdleCallback): not while a
-      // pointer is down, unless the drag goes on for more than 1.5 s
+      // pointer is down or the page is scrolling, unless that goes on for more than 1.5 s
       const now = performance.now();
-      if (this.M.pointers.size) {
+      if (this.M.pointers.size || now - this.M.scrollAt < 250) {
         if (!this.heldSince) this.heldSince = now;
         if (now - this.heldSince < 1500) { this.timer = setTimeout(go, 250); return; }
       }
@@ -996,10 +1037,12 @@ class Glass {
     this.p = resolveOptions(this.user);
     this.touch = { amt: 0, x: 0, y: 0 };
     this.ptr = null;
-    this.frame = { cx: 0, cy: 0, A: [1, 0, 0, 1] };
+    this.frame = { cx: 0, cy: 0, A: [1, 0, 0, 1], lx: 0, ly: 0 };
+    this.kx = -1; this.ky = -1; this.lastCX = 0; this.lastCY = 0;   // how much of a page scroll it does not follow
     this.others = [];
     this.fuse = [];
     this.plate = null;         // shared backplate while fused with other glass
+    this.snapFused = 0;        // fused in the snapshot engine: 1 own backdrop without dimming, 2 painted from the snapshot
     this.press = 0;
     this.layer = '';
     this.pageScale = 1;
@@ -1273,9 +1316,10 @@ class Glass {
     this.dirty = true;
   }
 
+  // (fused in the snapshot engine the dimming is painted by the canvas instead, once over the merged shape)
   cssBackdrop() {
     const P = this.p;
-    return [P.frost > 0.05 ? `blur(${P.frost.toFixed(2)}px)` : '', `saturate(${P.sat})`, P.dim > 0.001 ? `brightness(${(1 - P.dim).toFixed(3)})` : '']
+    return [P.frost > 0.05 ? `blur(${P.frost.toFixed(2)}px)` : '', `saturate(${P.sat})`, P.dim > 0.001 && this.snapFused !== 1 ? `brightness(${(1 - P.dim).toFixed(3)})` : '']
       .filter(Boolean).join(' ');
   }
 
@@ -1284,7 +1328,7 @@ class Glass {
     this.key = '';
     this.dirty = true;
     const eng = this.M.engine;
-    this.backdropOn = !this.plate;   // while fused, the shared backplate is the backdrop
+    this.backdropOn = !this.plate && this.snapFused !== 2;   // fused: the backplate (native) or the canvas shows the page
     if (eng === 'native') this.buildNative();
     else {
       this.removeFilter();
@@ -1413,10 +1457,24 @@ class Glass {
     if (!this.bgHold && cs.backgroundColor !== this.bgColor) { this.bgColor = cs.backgroundColor; this.tint.set(parseColor(this.bgColor)); }
     this.rect = r;
     this.layer = (cs.position === 'fixed' ? 'f' : 'n') + '|' + cs.zIndex;
+    if (this.ky < 0) { this.kx = this.ky = cs.position === 'fixed' ? 1 : 0; this.lastCX = cx; this.lastCY = cy; }
     if (this.p.adaptive) this.luminance = this.M.luminanceAt(cx, cy, this.geom.hw * 0.8, this.geom.hh * 0.8);
     const pad = this.geom.pad;
     this.visible = !(r.right < -pad || r.bottom < -pad || r.left > global.innerWidth + pad || r.top > global.innerHeight + pad);
     return true;
+  }
+
+  // Scroll prediction (snapshot engine). Glass that stays put on screen while the page scrolls (fixed, or sticky
+  // while stuck) shows content that the compositor has already scrolled further by the time this frame is on
+  // screen; glass that scrolls with the page carries its canvas along and needs nothing. k says which it is
+  // (measured: 1 + how far the glass moved on screen / how far the page scrolled), lx / ly is the lead in px.
+  trackScroll(dx, dy, vx, vy) {
+    const f = this.frame;
+    if (Math.abs(dx) > 0.5) this.kx = clamp(1 + (f.cx - this.lastCX) / dx, 0, 1);
+    if (Math.abs(dy) > 0.5) this.ky = clamp(1 + (f.cy - this.lastCY) / dy, 0, 1);
+    this.lastCX = f.cx; this.lastCY = f.cy;
+    f.lx = clamp(this.kx * vx, -400, 400);
+    f.ly = clamp(this.ky * vy, -400, 400);
   }
 
   // gap between the two boxes (ignores the corner radius, so it errs on the near side)
@@ -1438,8 +1496,8 @@ class Glass {
     if (eng === 'snapshot' && !useSnap) return false;
     const f = this.frame;
     const rk = (o) => [o.rect.left, o.rect.top, o.rect.width, o.rect.height].map((v) => v.toFixed(1)).join(',') + o.bgColor;
-    const key = [eng, this.press.toFixed(3), this.bgColor, this.bgHold ? 'h' : '',
-      useSnap ? [f.cx.toFixed(2), f.cy.toFixed(2), global.scrollX, global.scrollY, snap.version].join(',') : '',
+    const key = [eng, this.press.toFixed(3), this.bgColor, this.bgHold ? 'h' : '', this.snapFused,
+      useSnap ? [f.cx.toFixed(2), f.cy.toFixed(2), (global.scrollX + f.lx).toFixed(2), (global.scrollY + f.ly).toFixed(2), snap.version].join(',') : '',
       useSnap ? f.A.map((v) => v.toFixed(4)).join(',') : '',
       this.fuse.length ? rk(this) + ':' + this.fuse.map(rk).join(';') : '', useSnap ? this.others.map(rk).join(';') : ''].join('|');
     if (!this.dirty && key === this.key) return false;
@@ -1450,9 +1508,10 @@ class Glass {
   }
 
   // the element's own backdrop is switched off while a shared backplate shows the page under the merged shape
-  setBackdrop(on) {
-    if (this.backdropOn === on) return;
+  setBackdrop(on, snapFused) {
+    if (this.backdropOn === on && this.snapFused === snapFused) return;
     this.backdropOn = on;
+    this.snapFused = snapFused;
     this.applyBackdrop();
   }
   applyBackdrop() {
@@ -1592,54 +1651,6 @@ class UnionField {
     return 0;
   }
 }
-// outline of the region f < 0 (grid of nx * ny values, step gs px) as SVG path data, for fill-rule evenodd.
-// Marching squares; crossing points are keyed by grid edge: horizontal 2 * node, vertical 2 * node + 1
-function contourPath(f, nx, ny, gs) {
-  const link = new Map();
-  const add = (a, b) => {
-    let l = link.get(a); if (!l) link.set(a, l = []); l.push(b);
-    l = link.get(b); if (!l) link.set(b, l = []); l.push(a);
-  };
-  for (let j = 0; j < ny - 1; j++) {
-    for (let i = 0; i < nx - 1; i++) {
-      const n = j * nx + i;
-      const a = f[n] < 0, b = f[n + 1] < 0, c = f[n + nx + 1] < 0, d = f[n + nx] < 0;   // tl tr br bl
-      if (a === b && b === c && c === d) continue;
-      const T = 2 * n, R = 2 * (n + 1) + 1, B = 2 * (n + nx), L = 2 * n + 1;
-      const cut = [];
-      if (a !== b) cut.push(T);
-      if (b !== c) cut.push(R);
-      if (c !== d) cut.push(B);
-      if (d !== a) cut.push(L);
-      if (cut.length === 2) { add(cut[0], cut[1]); continue; }
-      // saddle: the centre decides whether the two inside corners connect
-      const mid = (f[n] + f[n + 1] + f[n + nx + 1] + f[n + nx]) / 4 < 0;
-      if (mid === a) { add(T, R); add(B, L); } else { add(T, L); add(R, B); }
-    }
-  }
-  const at = (key) => {
-    const n = key >> 1, i = n % nx, j = (n - i) / nx;
-    if (key & 1) { const t = f[n] / (f[n] - f[n + nx]); return ((i * gs).toFixed(2) + ' ' + ((j + t) * gs).toFixed(2)); }
-    const t = f[n] / (f[n] - f[n + 1]); return (((i + t) * gs).toFixed(2) + ' ' + (j * gs).toFixed(2));
-  };
-  const seen = new Set();
-  let out = '';
-  for (const start of link.keys()) {
-    if (seen.has(start)) continue;
-    let prev = -1, cur = start, first = true;
-    while (cur !== undefined && !seen.has(cur)) {
-      seen.add(cur);
-      out += (first ? 'M' : 'L') + at(cur);
-      first = false;
-      const l = link.get(cur);
-      const next = l[0] !== prev ? l[0] : l[1];
-      prev = cur; cur = next;
-    }
-    out += 'Z';
-  }
-  return out || 'M0 0Z';
-}
-
 let plateUid = 0;
 class Plate {
   constructor(M, anchor) {
@@ -1709,12 +1720,12 @@ class Plate {
     if (key !== this.key) {
       this.key = key;
       const t0 = performance.now();
-      if (native) this.buildMap(D, W, H); else this.buildClip(D, W, H);
+      this.buildMap(D, W, H);
       const st = this.M.stats;
       st.plateBuilds++;
       st.plateMs = st.plateMs ? st.plateMs * 0.8 + (performance.now() - t0) * 0.2 : performance.now() - t0;
     }
-    const bf = native ? (this.filters ? `url(#${this.filters[this.fi].id})` : 'none') : members[0].cssBackdrop();
+    const bf = this.filters ? `url(#${this.filters[this.fi].id})` : 'none';
     if (bf !== this.bf) { this.bf = bf; this.el.style.backdropFilter = bf; this.el.style.webkitBackdropFilter = bf; }
   }
 
@@ -1781,23 +1792,6 @@ class Plate {
   }
 
   // snapshot: clip the CSS backdrop to the merged outline (vector, so it updates in the same frame everywhere)
-  buildClip(D, W, H) {
-    let mMin = Infinity;
-    for (const d of D) mMin = Math.min(mMin, d.m);
-    const gs = clamp(mMin / 8, 0.75, 2);
-    const nx = Math.ceil(W / gs) + 1, ny = Math.ceil(H / gs) + 1;
-    const f = new Float32Array(nx * ny), U = new UnionField(D);
-    for (let j = 0; j < ny; j++) {
-      for (let i = 0; i < nx; i++) {
-        const v = U.at(i * gs, j * gs);
-        f[j * nx + i] = i === 0 || j === 0 || i === nx - 1 || j === ny - 1 ? Math.max(v, 1e-3) : v;
-      }
-    }
-    const clip = `path(evenodd, '${contourPath(f, nx, ny, gs)}')`;
-    this.el.style.clipPath = clip;
-    this.el.style.webkitClipPath = clip;
-  }
-
   destroy() {
     this.el.remove();
     this.anchor.holdBackground(false);
@@ -1816,6 +1810,7 @@ class Manager {
     this.stats = {
       engine: '', glasses: 0, captures: 0, lastCaptureMs: 0, captureOnlyMs: 0, uploadMs: 0, renderMs: 0,
       snapW: 0, snapH: 0, scale: 0, live: 0, holes: 0, error: '', parts: null, plates: 0, plateBuilds: 0, plateMs: 0, rafMs: 0, inputFrames: 0,
+      scrollLead: 0, scrollV: 0,
     };
     this.plates = new Map();   // lowest glass of a fused group -> its shared backplate
   }
@@ -1838,6 +1833,7 @@ class Manager {
     this.tick = this.tick.bind(this);
     this.lastTick = performance.now();
     this.pumped = false; this.pumpT = 0; this.pumpWall = 0; this.rafDt = 0; this.lastRafT = 0;
+    this.sX = global.scrollX; this.sY = global.scrollY; this.sT = 0; this.svx = 0; this.svy = 0; this.sMoved = 0;
     this.hookRaf();
     this.rafId = this.raf(this.tick);
     this.watchThrottle();
@@ -1946,7 +1942,7 @@ class Manager {
   // pass 2b: fused glass forms groups (connected through g.fuse); each group gets one backplate
   updatePlates() {
     const next = new Map(), seen = new Set();
-    for (const g of this.glasses) g.plate = null;
+    for (const g of this.glasses) { g.plate = null; g.snapGroup = 0; }
     for (const g of this.glasses) {
       if (!g.fuse.length || seen.has(g)) continue;
       const members = [], stack = [g];
@@ -1965,6 +1961,8 @@ class Manager {
         }
         continue;
       }
+      // snapshot engine: no backplate (see uSnapFill in the shader)
+      if (this.engine !== 'native') { for (const m of members) m.snapGroup = m.p.frost >= SNAP_FILL_FROST ? 2 : 1; continue; }
       const anchor = members[0];
       let pl = this.plates.get(anchor);
       if (pl && !pl.inPlace()) { pl.destroy(); pl = null; }
@@ -1977,7 +1975,8 @@ class Manager {
     this.plates = next;
     this.fusing = next.size > 0;
     this.stats.plates = next.size;
-    for (const g of this.glasses) if (g.geom) g.setBackdrop(!g.plate);   // unmeasured glass has no backdrop yet
+    // unmeasured glass has no backdrop yet
+    for (const g of this.glasses) if (g.geom) g.setBackdrop(!g.plate && g.snapGroup !== 2, g.snapGroup);
   }
 
   defs() {
@@ -2046,16 +2045,22 @@ class Manager {
     global.addEventListener('pointercancel', up, true);
     global.addEventListener('blur', () => this.pointers.clear());
     this.mo = new MutationObserver((recs) => { if (recs.some(mutationMatters)) req(); });
-    this.mo.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+    this.mo.observe(document.body, { subtree: true, childList: true, attributes: true, attributeOldValue: true, characterData: true });
     const onEvt = (e) => { if (!isIgnored(e.target)) req(); };
     document.addEventListener('input', onEvt, true);
     document.addEventListener('change', onEvt, true);
     document.addEventListener('load', onEvt, true);
+    // the snapshot is in page coordinates: a viewport that only got taller or shorter (the iOS / Android toolbar
+    // collapsing as the page scrolls) changes nothing in it, and a capture then would stall the scroll
+    let vpW = global.innerWidth;
     global.addEventListener('resize', () => {
       const d = Math.min(global.devicePixelRatio || 1, 2);
-      if (d !== this.dpr) { this.dpr = d; for (const g of this.glasses) g.geom = null; }
-      req();
+      if (d !== this.dpr) { this.dpr = d; for (const g of this.glasses) g.geom = null; req(); }
+      if (global.innerWidth !== vpW) { vpW = global.innerWidth; req(); }
     });
+    // scrolling needs no new snapshot; captures wait until it stops (see Capturer)
+    this.scrollAt = -1e9;
+    global.addEventListener('scroll', () => { this.scrollAt = performance.now(); }, { capture: true, passive: true });
     if (document.fonts) {
       document.fonts.ready.then(req);
       if (document.fonts.addEventListener) document.fonts.addEventListener('loadingdone', req);
@@ -2208,6 +2213,26 @@ class Manager {
     this.frame(now);
   }
 
+  // page scroll velocity (px/ms), smoothed; it drops to 0 once the page has not moved for 50 ms
+  trackScroll(now) {
+    const sx = global.scrollX, sy = global.scrollY, dt = now - this.sT;
+    if (!(dt > 0)) return;   // the same rendering update again (rerun)
+    const dx = sx - this.sX, dy = sy - this.sY;
+    if (dx || dy) {
+      const a = this.sT && dt < 100 ? 0.5 : 1;
+      this.svx += (dx / dt - this.svx) * a; this.svy += (dy / dt - this.svy) * a;
+      this.sMoved = now;
+    } else if (now - this.sMoved > 50) { this.svx = 0; this.svy = 0; }
+    this.sX = sx; this.sY = sy; this.sT = now;
+    let lead = this.cfg.scrollLead;
+    if (lead === 'auto') lead = IS_IOS ? 32 : 16;
+    lead = Math.max(0, +lead || 0);
+    this.stats.scrollLead = lead;
+    if (this.engine !== 'snapshot') lead = 0;   // the native engine refracts the live page, nothing to predict
+    this.stats.scrollV = Math.round(Math.hypot(this.svx, this.svy) * 1000);
+    for (const g of this.glasses) g.trackScroll(dx, dy, this.svx * lead, this.svy * lead);
+  }
+
   frame(now) {
     const dt = Math.min(0.05, Math.max(0, (now - this.lastTick) / 1000));
     this.lastTick = now;
@@ -2216,6 +2241,7 @@ class Manager {
     // pass 1: positions and layers
     for (const g of this.glasses) g.stepPress(dt);
     for (const g of this.glasses) { g.measureFrame(); g.stepLight(dt); }
+    this.trackScroll(now);
     for (const pl of this.plates.values()) pl.measure();
     // pass 2: who fuses with whom (same layer, closer than blend), who just overlaps (a hole). Fusing needs
     // the WebGL highlights; in the snapshot engine also the snapshot the rim is refracted from

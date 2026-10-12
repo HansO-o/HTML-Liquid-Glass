@@ -337,8 +337,8 @@ p code, li code, td code { background: #e8eaef; padding: 1px 6px; border-radius:
 
   <section id="merge">
     <h2>靠近就融合</h2>
-    <p>同一层（同一个父元素下、相同 z-index 和定位方式）、同一种材质的玻璃不会互相压出边缘。两块玻璃的距离小于 <code>blend</code>（默认 24px）时，形状开始像水滴一样连在一起；叠在一起时共用一块背板，重叠的部分没有内边缘，高光和投影也只沿着整体的外轮廓走。</p>
-    <p>融合以后，SDK 在这组玻璃最下面那块里面放一块共用的背板，由它显示整个融合形状下面的页面，玻璃自己的背景滤镜先关掉。原生引擎里背板是按融合后的轮廓生成位移图的 SVG 滤镜，快照引擎里是裁成轮廓的 CSS 模糊；两种情况过滤的都是实时页面，所以融合不截图，玻璃后面的画面也不会变。高光和投影仍然每个像素只由一块玻璃负责：自己的内部归自己，重叠部分归画在最下面的那块，两块之间的连接桥归离得近的那块。在参数面板里新建几块面板，把它们拖到一起试试；不想融合的元素设 <code>merge: false</code>。</p>
+    <p>同一层（同一个父元素下、相同 z-index 和定位方式）、同一种材质的玻璃不会互相压出边缘。两块玻璃的距离小于 <code>blend</code>（默认 24px）时，形状开始像水滴一样连在一起；叠在一起时重叠的部分没有内边缘，高光和投影也只沿着整体的外轮廓走。</p>
+    <p>融合以后，原生引擎在这组玻璃最下面那块里面放一块共用的背板：按融合后的轮廓生成位移图的 SVG 滤镜，由它显示整个融合形状下面的页面，玻璃自己的背景滤镜先关掉。快照引擎不用背板，因为 Safari 和 Chrome 都不能可靠地用 clip-path 裁背景滤镜：每块玻璃保留自己的圆角背景滤镜，压暗改由画布按融合后的形状只画一次，连接桥下面的页面从快照里取；磨砂到 2px 以上时，两层模糊叠在一起会露出下面那块的边缘，这时整个融合形状改由画布从快照画（已经模糊过，看不出分辨率低）。融合本身不截图，磨砂不大时玻璃后面仍是实时页面。高光和投影仍然每个像素只由一块玻璃负责：自己的内部归自己，重叠部分归画在最下面的那块，两块之间的连接桥归离得近的那块。在参数面板里新建几块面板，把它们拖到一起试试；不想融合的元素设 <code>merge: false</code>。</p>
   </section>
 
   <section id="refresh">
@@ -372,7 +372,7 @@ p code, li code, td code { background: #e8eaef; padding: 1px 6px; border-radius:
           <tr><td>中间平坦区域交给 CSS 模糊，WebGL 只算边缘一圈</td><td>着色器的重活只在几个像素宽的环上</td></tr>
           <tr><td>实时图层只在玻璃经过时上传自己那一小块</td><td>不重拍整页</td></tr>
           <tr><td>屏幕外的玻璃不绘制；所有玻璃共用一个 WebGL 上下文；大面板的投影范围有上限</td><td>面板再多、再大，开销也基本只和屏幕上的玻璃有关</td></tr>
-          <tr><td>融合用实时背板，不截图；背板的位移图只在玻璃相对位置变化时重建，按 1 个 CSS 像素一格生成，跳过离轮廓远的区域</td><td>拖着融合中的玻璃时每帧约几毫秒，静止或整组移动时为零</td></tr>
+          <tr><td>融合直接过滤实时页面，不截图；原生引擎的背板位移图只在玻璃相对位置变化时重建，按 1 个 CSS 像素一格生成，跳过离轮廓远的区域</td><td>拖着融合中的玻璃时每帧约几毫秒，静止或整组移动时为零</td></tr>
           <tr><td>每帧的测量和绘制排在页面自己的动画回调之后；拖动时指针柔光固定在手指下</td><td>页面在动画循环里移动的玻璃当帧就画在新位置，不慢一帧；拖动中玻璃不用每帧重画</td></tr>
         </tbody>
       </table>
@@ -491,6 +491,8 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
         <button type="button" data-v="0.5" aria-pressed="true">½</button>
         <button type="button" data-v="0.25" aria-pressed="false">¼</button>
       </div>
+      <div class="row"><label for="p-lead">滚动预测</label><input type="range" id="p-lead" min="0" max="80" step="1" value="32"><output id="o-lead" for="p-lead">自动</output></div>
+      <p class="note">滚动是浏览器在另一个线程里做的，边缘那圈却要等 JS 画完才更新，所以会慢几帧。这里按滚动速度往前多取几毫秒的位置：边缘跟不上就调大，跑到内容前面就调小。只对快照引擎有用。</p>
     </div>
 
     <div class="grp">
@@ -531,6 +533,7 @@ LiquidGlass.config({ engine: <span class="s">'auto'</span>, captureScale: <span 
         <dt>每帧绘制</dt><dd id="s-render">—</dd>
         <dt>实时图层</dt><dd id="s-live">—</dd>
         <dt>动画帧率</dt><dd id="s-fps">—</dd>
+        <dt>滚动速度</dt><dd id="s-scroll">—</dd>
       </dl>
       <p class="note" id="s-error" hidden></p>
     </div>
@@ -587,7 +590,8 @@ let vw = window.innerWidth, vh = window.innerHeight;
   const ctx = cv.getContext('2d');
   const size = () => {
     const d = Math.min(window.devicePixelRatio || 1, 2);
-    cv.width = Math.round(cv.clientWidth * d); cv.height = Math.round(cv.clientHeight * d);
+    const w = Math.round(cv.clientWidth * d), h = Math.round(cv.clientHeight * d);
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
   };
   size();
   window.addEventListener('resize', size);
@@ -960,6 +964,16 @@ $('#seg-cap').addEventListener('click', (e) => {
   setSeg($('#seg-cap'), b.dataset.v);
   LiquidGlass.config({ capturer: b.dataset.v });
 });
+// scroll prediction: 'auto' until the slider is touched
+const leadIn = $('#p-lead');
+let leadAuto = true;
+paintRange(leadIn);
+leadIn.addEventListener('input', () => {
+  leadAuto = false;
+  LiquidGlass.config({ scrollLead: Number(leadIn.value) });
+  $('#o-lead').textContent = leadIn.value + 'ms';
+  paintRange(leadIn);
+});
 $('#seg-scale').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   setSeg($('#seg-scale'), b.dataset.v);
@@ -976,7 +990,8 @@ $('#p-reset').addEventListener('click', () => {
   Object.assign(P, DEF); syncRows(); setGlow(); applyGlassNow();
   setContrast('off'); setEngine('auto');
   setSeg($('#seg-scale'), '0.5'); setSeg($('#seg-cap'), 'fast');
-  LiquidGlass.config({ captureScale: 0.5, capturer: 'fast' });
+  LiquidGlass.config({ captureScale: 0.5, capturer: 'fast', scrollLead: 'auto' });
+  leadAuto = true; $('#o-lead').textContent = '自动';
   setProgress(0.62); phase = 'run'; setPlaying(!reduceMotion); placeInitial();
 });
 function setPanel(open) {
@@ -1014,6 +1029,8 @@ setInterval(() => {
   $('#s-live').textContent = s.engine === 'snapshot' ? String(s.live) : '—';
   // Safari / iOS halve requestAnimationFrame in a cross-origin frame until the first tap; the SDK then draws
   // from pointer input instead (counted here)
+  $('#s-scroll').textContent = `${s.scrollV} px/s · 预测 ` + (LiquidGlass.engine === 'snapshot' ? s.scrollLead + ' ms' : '不需要');
+  if (leadAuto) { leadIn.value = s.scrollLead; paintRange(leadIn); }
   $('#s-fps').textContent = s.rafMs ? `${Math.round(1000 / s.rafMs)} fps` + (s.inputFrames ? ` · 输入补帧 ${s.inputFrames}` : '') : '—';
   const err = $('#s-error');
   err.hidden = !s.error;
